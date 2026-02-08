@@ -1,0 +1,5 @@
+cmake-build-*
+build/
+*.o
+httpserver
+*.log
