@@ -89,5 +89,4 @@ int main(void) {
     printf("Server closed.\n");
     return EXIT_SUCCESS;
 
-    //Test push
 }
