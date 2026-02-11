@@ -1,6 +1,19 @@
-cmake_minimum_required(VERSION 4.1)
-project(Multithreaded_HTTP_Server C)
+cmake_minimum_required(VERSION 3.16)
 
-set(CMAKE_C_STANDARD 17)
+project(MultithreadedHTTPServer C)
 
-add_executable(Multithreaded_HTTP_Server main.c)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+add_compile_options(-Wall -Wextra -Wpedantic -Werror -O2)
+
+find_package(Threads REQUIRED)
+
+add_executable(httpserver
+        src/main.c
+)
+
+target_link_libraries(httpserver PRIVATE
+        Threads::Threads     # pthread biblioteka
+        rt                   # realtime biblioteka (clock_gettime, itd.)
+)

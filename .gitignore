@@ -1,5 +1,10 @@
-cmake-build-*
+# CMake build
 build/
+cmake-build-debug/
+cmake-build-release/
+
 *.o
 httpserver
+server
+
 *.log
