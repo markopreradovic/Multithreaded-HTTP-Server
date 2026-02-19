@@ -18,6 +18,9 @@
 #define MAX_EVENTS 64
 #define SERVER_NAME "CServer/0.1"
 #define THREAD_COUNT 4 //worker threads
+#define MAX_HEADER_COUNT 64
+#define MAX_HEADER_LEN 512
+#define READ_BUFFER_SIZE 4096
 
 volatile sig_atomic_t running = 1;
 
@@ -37,15 +40,97 @@ typedef struct {
     volatile int shutdown;
 } thread_pool_t;
 
+typedef struct {
+    char method[16];
+    char uri[1024];  //index.html?param=1
+    char version[16]; //1.1
+    char headers[MAX_HEADER_COUNT][MAX_HEADER_LEN];
+    int header_count;
+    size_t content_length;
+    char *body;
+} http_request_t;
+
+static void free_request(http_request_t *req) {
+    if (req->body) free(req->body);
+    memset(req,0,sizeof(*req));
+}
+
+static int parse_request(int client_fd, http_request_t *req) {
+    char buffer[READ_BUFFER_SIZE];
+    ssize_t total_read = 0;
+    ssize_t n;
+
+    memset(req,0,sizeof(*req));
+
+    //Reading until \r\n\r\n
+    while (total_read < sizeof(buffer) - 1) {
+        n = recv(client_fd, buffer + total_read, sizeof(buffer) - total_read - 1, 0);
+        if (n <= 0) {
+            if (n == 0) printf("[Parser] Connection closed by client\n");
+            else        perror("[Parser] recv");
+            return -1;
+        }
+
+        total_read += n;
+        buffer[total_read] = '\0';
+
+        if (strstr(buffer, "\r\n\r\n")) {
+            break;
+        }
+    }
+
+    if (total_read == 0) return -1;
+
+    char* line = strtok(buffer, "\r\n");
+    if (!line) return -1;
+
+    if (sscanf(line, "%15s %1023s %15s", req->method, req->uri, req->version) != 3) {
+        printf("[Parser] Invalid request line: %s\n", line);
+        return -1;
+    }
+
+    //Header parsing
+    while ((line = strtok(NULL, "\r\n")) != NULL && strlen(line) > 0) {
+        if (req->header_count >= MAX_HEADER_COUNT) break;
+
+        strncpy(req->headers[req->header_count], line, MAX_HEADER_LEN - 1);
+        req->headers[req->header_count][MAX_HEADER_LEN - 1] = '\0';
+        req->header_count++;
+
+        if (strncasecmp(line, "Content-Length:", 15) == 0) {
+            req->content_length = strtoul(line + 15, NULL, 10);
+        }
+    }
+    return 0;
+}
+
+static void print_request(const http_request_t* req) {
+    printf("[Worker] Parsed request:\n");
+    printf("  Method: %s\n", req->method);
+    printf("  URI:    %s\n", req->uri);
+    printf("  Version:%s\n", req->version);
+    printf("  Headers (%d):\n", req->header_count);
+
+    for (int i = 0; i < req->header_count; i++) {
+        printf("    %s\n", req->headers[i]);
+    }
+
+    if (req->content_length > 0) {
+        printf("  Body expected: %zu bytes\n", req->content_length);
+    }
+    fflush(stdout);
+}
+
 static thread_pool_t pool = {0};
 
-static void* worker_thread(void *arg) {
+static void* worker_thread(void* arg) {
     (void)arg;
 
     while (1) {
-        task_t *task = NULL;
+        task_t* task = NULL;
 
         pthread_mutex_lock(&pool.queue_mutex);
+
         while (pool.queue_head == NULL && !pool.shutdown) {
             pthread_cond_wait(&pool.queue_cond, &pool.queue_mutex);
         }
@@ -55,7 +140,6 @@ static void* worker_thread(void *arg) {
             return NULL;
         }
 
-        //takes the task from the queue head
         task = pool.queue_head;
         pool.queue_head = task->next;
         if (pool.queue_head == NULL) {
@@ -64,14 +148,32 @@ static void* worker_thread(void *arg) {
 
         pthread_mutex_unlock(&pool.queue_mutex);
 
-        //Task processing
+        // Conn.
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &task->client_addr.sin_addr, client_ip, sizeof(client_ip));
-        printf("[Worker] Processing connection from %s:%d (fd=%d)\n", client_ip, ntohs(task->client_addr.sin_port), task->client_fd);
 
+        uint16_t client_port = ntohs(task->client_addr.sin_port);
+
+        printf("[Worker] Processing connection from %s:%u (fd=%d)\n",
+               client_ip, client_port, task->client_fd);
+
+        // Http req parsing
+        http_request_t req;
+        memset(&req, 0, sizeof(req));
+
+        if (parse_request(task->client_fd, &req) == 0) {
+            print_request(&req);
+        }
+        else {
+            printf("[Worker] Failed to parse request or connection closed early from %s:%u (fd=%d)\n",
+                   client_ip, client_port, task->client_fd);
+        }
+
+        free_request(&req);
         close(task->client_fd);
         free(task);
     }
+
     return NULL;
 }
 
@@ -239,7 +341,6 @@ int main(void) {
                     continue;
                 }
 
-                // Umesto close() → šaljemo u thread pool
                 enqueue_task(client_fd, &client_addr);
             }
         }
