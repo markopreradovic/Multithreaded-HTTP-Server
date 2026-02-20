@@ -11,6 +11,9 @@
 #include <arpa/inet.h>   // inet_ntoa (for debugging later)
 #include <sys/epoll.h>
 #include <pthread.h>
+#include <fcntl.h>     // open, O_RDONLY
+#include <sys/stat.h>  // stat, fstat
+#include <sys/sendfile.h>
 
 #define DEFAULT_PORT 8080
 #define BACKLOG 128
@@ -62,7 +65,7 @@ static int parse_request(int client_fd, http_request_t *req) {
     memset(req,0,sizeof(*req));
 
     //Reading until \r\n\r\n
-    while (total_read < sizeof(buffer) - 1) {
+    while (total_read < (ssize_t)(sizeof(buffer) - 1))  {
         n = recv(client_fd, buffer + total_read, sizeof(buffer) - total_read - 1, 0);
         if (n <= 0) {
             if (n == 0) printf("[Parser] Connection closed by client\n");
@@ -163,6 +166,61 @@ static void send_hello_world(int client_fd) {
 
 static thread_pool_t pool = {0};
 
+static const char* get_content_type(const char* path) {
+    const char* ext = strrchr(path, '.');
+    if (!ext) return "application/octet-stream";
+
+    if (strcasecmp(ext, ".html") == 0 || strcasecmp(ext, ".htm") == 0) return "text/html; charset=utf-8";
+    if (strcasecmp(ext, ".css")  == 0) return "text/css; charset=utf-8";
+    if (strcasecmp(ext, ".txt")  == 0) return "text/plain; charset=utf-8";
+    if (strcasecmp(ext, ".jpg")  == 0 || strcasecmp(ext, ".jpeg") == 0) return "image/jpeg";
+    if (strcasecmp(ext, ".png")  == 0) return "image/png";
+    if (strcasecmp(ext, ".gif")  == 0) return "image/gif";
+
+    return "application/octet-stream";
+}
+
+static void serve_file(int client_fd, const char* filepath) {
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0) {
+        send_404(client_fd);
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        send_404(client_fd);
+        return;
+    }
+
+    size_t file_size = st.st_size;
+
+    // Header
+    char header[1024];
+    snprintf(header, sizeof(header),
+             "HTTP/1.1 200 OK\r\n"
+             "Server: %s\r\n"
+             "Content-Type: %s\r\n"
+             "Content-Length: %zu\r\n"
+             "Connection: close\r\n"
+             "\r\n",
+             SERVER_NAME,
+             get_content_type(filepath),
+             file_size);
+
+    send(client_fd, header, strlen(header), 0);
+
+    // Slanje sadržaja fajla (za sada read + send)
+    char buf[8192];
+    ssize_t bytes_read;
+    while ((bytes_read = read(fd, buf, sizeof(buf))) > 0) {
+        send(client_fd, buf, bytes_read, 0);
+    }
+
+    close(fd);
+}
+
 static void* worker_thread(void* arg) {
     (void)arg;
 
@@ -188,7 +246,6 @@ static void* worker_thread(void* arg) {
 
         pthread_mutex_unlock(&pool.queue_mutex);
 
-        // Conn.
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &task->client_addr.sin_addr, client_ip, sizeof(client_ip));
 
@@ -197,29 +254,50 @@ static void* worker_thread(void* arg) {
         printf("[Worker] Processing connection from %s:%u (fd=%d)\n",
                client_ip, client_port, task->client_fd);
 
-        // Http req parsing
         http_request_t req;
         memset(&req, 0, sizeof(req));
 
-        if (parse_request(task->client_fd, &req) == 0) {
-            print_request(&req);
+        if (parse_request(task->client_fd, &req) != 0) {
+            printf("[Worker] Parse failed or connection closed early from %s:%u\n",
+                   client_ip, client_port);
+            send_response(task->client_fd, 400, "<h1>400 Bad Request</h1>", 23, "text/html");
+            goto cleanup;
+        }
 
-            // Nova logika faze 6
-            if (strcmp(req.uri, "/") == 0 || strcmp(req.uri, "") == 0) {
-                printf("[Worker] Sending Hello World response to %s:%u\n", client_ip, client_port);
-                send_hello_world(task->client_fd);
+        print_request(&req);
+
+        char full_path[1024] = {0};
+        const char* document_root = "./www";
+
+        // Osnovna zaštita – blokiramo samo opasne sekvence
+        if (strstr(req.uri, "..") != NULL ||
+            strstr(req.uri, "/.") != NULL ||
+            strstr(req.uri, "\\") != NULL) {
+            printf("[Worker] Forbidden path attempt: %s from %s:%u\n",
+                   req.uri, client_ip, client_port);
+            send_response(task->client_fd, 403, "<h1>403 Forbidden</h1>", 23, "text/html");
+            goto cleanup;
+            }
+
+        // Mapiranje URI-ja na fajl
+        if (strcmp(req.uri, "/") == 0 || strcmp(req.uri, "") == 0) {
+            snprintf(full_path, sizeof(full_path), "%s/index.html", document_root);
+        } else {
+            // Dodajemo početni / ako ga nema (ali većina klijenata šalje sa /)
+            if (req.uri[0] != '/') {
+                snprintf(full_path, sizeof(full_path), "%s/%s", document_root, req.uri);
             } else {
-                printf("[Worker] Sending 404 for URI: %s from %s:%u\n", req.uri, client_ip, client_port);
-                send_404(task->client_fd);
+                snprintf(full_path, sizeof(full_path), "%s%s", document_root, req.uri);
             }
         }
-        else {
-            // greška u parsiranju → šaljemo 400 Bad Request ili zatvaramo
-            printf("[Worker] Sending 400 Bad Request due to parse error from %s:%u\n", client_ip, client_port);
-            const char* bad_req_body = "<h1>400 Bad Request</h1>";
-            send_response(task->client_fd, 400, bad_req_body, strlen(bad_req_body), "text/html");
-        }
 
+        // ── Serviranje ───────────────────────────────────────────────────────
+        printf("[Worker] Attempting to serve: %s for URI %s from %s:%u\n",
+               full_path, req.uri, client_ip, client_port);
+
+        serve_file(task->client_fd, full_path);
+
+    cleanup:
         free_request(&req);
         close(task->client_fd);
         free(task);
