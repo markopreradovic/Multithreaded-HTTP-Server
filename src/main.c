@@ -1,7 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 #include <stdio.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>      // close, read, write, pause...
@@ -121,6 +120,47 @@ static void print_request(const http_request_t* req) {
     fflush(stdout);
 }
 
+static void send_response(int client_fd, int status, const char* body, size_t body_len, const char* content_type) {
+    char header[1024];
+    const char* status_text = (status == 200) ? "OK" : "Not Found";
+    snprintf(header, sizeof(header),
+             "HTTP/1.1 %d %s\r\n"
+             "Server: %s\r\n"
+             "Content-Type: %s\r\n"
+             "Content-Length: %zu\r\n"
+             "Connection: close\r\n"           // keep-alive later
+             "\r\n",
+             status, status_text,
+             SERVER_NAME,
+             content_type,
+             body_len);
+    //Sending header..
+    send(client_fd, header, strlen(header), 0);
+    if (body && body_len > 0) send(client_fd,body,body_len,0);
+}
+
+static void send_404(int client_fd) {
+    const char* body =
+        "<!DOCTYPE html>\n"
+        "<html><head><title>404 Not Found</title></head>\n"
+        "<body><h1>404 Not Found</h1><p>The requested resource was not found on this server.</p></body></html>";
+    send_response(client_fd, 404, body, strlen(body), "text/html; charset=utf-8");
+}
+
+//Test func
+static void send_hello_world(int client_fd) {
+    const char* body =
+        "<!DOCTYPE html>\n"
+        "<html><head><title>Hello from C Server</title></head>\n"
+        "<body>\n"
+        "<h1>Hello, World!</h1>\n"
+        "<p>This is a simple response from my multithreaded HTTP server written in C.</p>\n"
+        "<p>Current time: " __DATE__ " " __TIME__ "</p>\n"
+        "</body></html>";
+
+    send_response(client_fd, 200, body, strlen(body), "text/html; charset=utf-8");
+}
+
 static thread_pool_t pool = {0};
 
 static void* worker_thread(void* arg) {
@@ -163,10 +203,21 @@ static void* worker_thread(void* arg) {
 
         if (parse_request(task->client_fd, &req) == 0) {
             print_request(&req);
+
+            // Nova logika faze 6
+            if (strcmp(req.uri, "/") == 0 || strcmp(req.uri, "") == 0) {
+                printf("[Worker] Sending Hello World response to %s:%u\n", client_ip, client_port);
+                send_hello_world(task->client_fd);
+            } else {
+                printf("[Worker] Sending 404 for URI: %s from %s:%u\n", req.uri, client_ip, client_port);
+                send_404(task->client_fd);
+            }
         }
         else {
-            printf("[Worker] Failed to parse request or connection closed early from %s:%u (fd=%d)\n",
-                   client_ip, client_port, task->client_fd);
+            // greška u parsiranju → šaljemo 400 Bad Request ili zatvaramo
+            printf("[Worker] Sending 400 Bad Request due to parse error from %s:%u\n", client_ip, client_port);
+            const char* bad_req_body = "<h1>400 Bad Request</h1>";
+            send_response(task->client_fd, 400, bad_req_body, strlen(bad_req_body), "text/html");
         }
 
         free_request(&req);
