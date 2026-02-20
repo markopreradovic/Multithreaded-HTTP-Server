@@ -20,6 +20,7 @@
 #include <stdatomic.h>
 #include <time.h>
 
+#define LATENCY_BUCKETS 10
 #define DEFAULT_PORT 8080
 #define BACKLOG 128
 #define MAX_EVENTS 64
@@ -38,6 +39,10 @@ static atomic_uint_fast64_t cache_hits          = 0;
 static atomic_uint_fast64_t cache_misses        = 0;
 static atomic_uint_fast64_t successful_responses = 0;  // 2xx
 static atomic_uint_fast64_t failed_responses    = 0;   // 4xx, 5xx
+static atomic_uint_fast64_t latency_buckets[LATENCY_BUCKETS] = {0};
+//For p50/p95/p99 approximation (simple, not exact)
+static atomic_uint_fast64_t latency_sum_us = 0;          // total microseconds
+static atomic_uint_fast64_t latency_count = 0;           // number of measured requests
 
 typedef struct cache_node {
     char* filepath;              // ključ
@@ -416,6 +421,30 @@ static int serve_file(int client_fd, const char* filepath) {
     return 200;  // success
 }
 
+// Record latency in microseconds
+static void metrics_record_latency(uint64_t start_ns) {
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    uint64_t end_ns = end.tv_sec * 1000000000ULL + end.tv_nsec;
+    uint64_t duration_ns = end_ns - start_ns;
+    uint64_t duration_us = duration_ns / 1000;
+
+    // Update sum and count
+    atomic_fetch_add(&latency_sum_us, duration_us);
+    atomic_fetch_add(&latency_count, 1);
+
+    // Bucket it
+    int bucket;
+    if (duration_us < 1000) bucket = 0;           // <1ms
+    else if (duration_us < 5000) bucket = 1;      // 1-5ms
+    else if (duration_us < 10000) bucket = 2;     // 5-10ms
+    else if (duration_us < 50000) bucket = 3;     // 10-50ms
+    else if (duration_us < 100000) bucket = 4;    // 50-100ms
+    else bucket = 5;                               // >100ms
+
+    atomic_fetch_add(&latency_buckets[bucket], 1);
+}
+
 static void cache_init(void) {
     pthread_mutex_init(&cache.mutex, NULL);
     cache.head = cache.tail = NULL;
@@ -462,6 +491,26 @@ static void metrics_print_summary(void) {
 
     double hit_rate = (hits + misses > 0) ? (double)hits / (hits + misses) * 100.0 : 0.0;
 
+    uint64_t count = atomic_load_explicit(&latency_count, memory_order_relaxed);
+    uint64_t sum_us = atomic_load_explicit(&latency_sum_us, memory_order_relaxed);
+    double avg_latency_ms = count > 0 ? (double)sum_us / count / 1000.0 : 0.0;
+
+    // Simple p50/p95/p99 approximation (not exact, but good enough)
+    uint64_t cumulative = 0;
+    double p50 = 0, p95 = 0, p99 = 0;
+    if (count > 0) {
+        uint64_t p50_target = count * 50 / 100;
+        uint64_t p95_target = count * 95 / 100;
+        uint64_t p99_target = count * 99 / 100;
+
+        for (int i = 0; i < LATENCY_BUCKETS; i++) {
+            cumulative += atomic_load_explicit(&latency_buckets[i], memory_order_relaxed);
+            if (p50 == 0 && cumulative >= p50_target) p50 = i * 10;  // rough bucket mid
+            if (p95 == 0 && cumulative >= p95_target) p95 = i * 10;
+            if (p99 == 0 && cumulative >= p99_target) p99 = i * 10;
+        }
+    }
+
     printf("\n[Metrics Summary]\n");
     printf("  Total requests:     %lu\n", total);
     printf("  Cache hits:         %lu\n", hits);
@@ -469,6 +518,10 @@ static void metrics_print_summary(void) {
     printf("  Cache hit rate:     %.2f%%\n", hit_rate);
     printf("  Successful (2xx):   %lu\n", success);
     printf("  Failed (4xx/5xx):   %lu\n", failures);
+    printf("  Avg latency:        %.2f ms\n", avg_latency_ms);
+    printf("  Latency p50:        ~%.0f ms\n", p50);
+    printf("  Latency p95:        ~%.0f ms\n", p95);
+    printf("  Latency p99:        ~%.0f ms\n", p99);
     fflush(stdout);
 }
 
@@ -513,12 +566,14 @@ static void send_metrics_json(int client_fd) {
     send(client_fd, json, strlen(json), 0);
 }
 
+// Worker thread - main request processing loop
 static void* worker_thread(void* arg) {
     (void)arg;
 
     while (1) {
         task_t* task = NULL;
 
+        // Wait for task
         pthread_mutex_lock(&pool.queue_mutex);
 
         while (pool.queue_head == NULL && !pool.shutdown) {
@@ -546,14 +601,21 @@ static void* worker_thread(void* arg) {
         printf("[Worker] Processing connection from %s:%u (fd=%d)\n",
                client_ip, client_port, task->client_fd);
 
+        // Start latency measurement
+        struct timespec start;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        uint64_t start_ns = start.tv_sec * 1000000000ULL + start.tv_nsec;
+
         http_request_t req;
         memset(&req, 0, sizeof(req));
 
+        // Parse HTTP request
         if (parse_request(task->client_fd, &req) != 0) {
             printf("[Worker] Parse failed or connection closed early from %s:%u\n",
                    client_ip, client_port);
             send_response(task->client_fd, 400, "<h1>400 Bad Request</h1>", 23, "text/html");
             metrics_increment_failure();
+            metrics_record_latency(start_ns);
             goto cleanup;
         }
 
@@ -563,6 +625,8 @@ static void* worker_thread(void* arg) {
         if (strcmp(req.uri, "/metrics") == 0) {
             printf("[Worker] Serving /metrics JSON from %s:%u\n", client_ip, client_port);
             send_metrics_json(task->client_fd);
+            metrics_increment_success();
+            metrics_record_latency(start_ns);
             goto cleanup;
         }
 
@@ -577,6 +641,7 @@ static void* worker_thread(void* arg) {
                    req.uri, client_ip, client_port);
             send_response(task->client_fd, 403, "<h1>403 Forbidden</h1>", 23, "text/html");
             metrics_increment_failure();
+            metrics_record_latency(start_ns);
             goto cleanup;
         }
 
@@ -594,12 +659,18 @@ static void* worker_thread(void* arg) {
         printf("[Worker] Attempting to serve: %s for URI %s from %s:%u\n",
                full_path, req.uri, client_ip, client_port);
 
+        // Serve file and get status
         int status = serve_file(task->client_fd, full_path);
+
+        // Update success/failure based on returned status
         if (status >= 200 && status < 300) {
             metrics_increment_success();
         } else {
             metrics_increment_failure();
         }
+
+        // Record latency
+        metrics_record_latency(start_ns);
 
     cleanup:
         free_request(&req);
