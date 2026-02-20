@@ -181,14 +181,18 @@ static const char* get_content_type(const char* path) {
 }
 
 static void serve_file(int client_fd, const char* filepath) {
+    printf("[serve_file] Trying to open: %s\n", filepath);
+
     int fd = open(filepath, O_RDONLY);
     if (fd < 0) {
+        perror("[serve_file] open failed");
         send_404(client_fd);
         return;
     }
 
     struct stat st;
     if (fstat(fd, &st) < 0) {
+        perror("[serve_file] fstat failed");
         close(fd);
         send_404(client_fd);
         return;
@@ -196,7 +200,7 @@ static void serve_file(int client_fd, const char* filepath) {
 
     size_t file_size = st.st_size;
 
-    // Header
+    // Header (isti kao prije)
     char header[1024];
     snprintf(header, sizeof(header),
              "HTTP/1.1 200 OK\r\n"
@@ -209,13 +213,25 @@ static void serve_file(int client_fd, const char* filepath) {
              get_content_type(filepath),
              file_size);
 
-    send(client_fd, header, strlen(header), 0);
+    if (send(client_fd, header, strlen(header), 0) < 0) {
+        perror("[serve_file] send header failed");
+        close(fd);
+        return;
+    }
 
-    // Slanje sadržaja fajla (za sada read + send)
-    char buf[8192];
-    ssize_t bytes_read;
-    while ((bytes_read = read(fd, buf, sizeof(buf))) > 0) {
-        send(client_fd, buf, bytes_read, 0);
+    off_t offset = 0;
+    ssize_t sent;
+
+    while (offset < file_size) {
+        sent = sendfile(client_fd, fd, &offset, file_size - offset);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            perror("[serve_file] sendfile failed");
+            break;
+        }
+        if (sent == 0) break;
     }
 
     close(fd);
