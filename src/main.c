@@ -183,20 +183,6 @@ static void send_404(int client_fd) {
     send_response(client_fd, 404, body, strlen(body), "text/html; charset=utf-8");
 }
 
-//Test func
-static void send_hello_world(int client_fd) {
-    const char* body =
-        "<!DOCTYPE html>\n"
-        "<html><head><title>Hello from C Server</title></head>\n"
-        "<body>\n"
-        "<h1>Hello, World!</h1>\n"
-        "<p>This is a simple response from my multithreaded HTTP server written in C.</p>\n"
-        "<p>Current time: " __DATE__ " " __TIME__ "</p>\n"
-        "</body></html>";
-
-    send_response(client_fd, 200, body, strlen(body), "text/html; charset=utf-8");
-}
-
 static thread_pool_t pool = {0};
 
 static const char* get_content_type(const char* path) {
@@ -486,6 +472,47 @@ static void metrics_print_summary(void) {
     fflush(stdout);
 }
 
+// Simple JSON metrics response
+static void send_metrics_json(int client_fd) {
+    uint64_t total    = atomic_load_explicit(&total_requests,      memory_order_relaxed);
+    uint64_t hits     = atomic_load_explicit(&cache_hits,          memory_order_relaxed);
+    uint64_t misses   = atomic_load_explicit(&cache_misses,        memory_order_relaxed);
+    uint64_t success  = atomic_load_explicit(&successful_responses, memory_order_relaxed);
+    uint64_t failures = atomic_load_explicit(&failed_responses,    memory_order_relaxed);
+
+    double hit_rate = (hits + misses > 0) ? (double)hits / (hits + misses) * 100.0 : 0.0;
+
+    char json[2048];
+    snprintf(json, sizeof(json),
+             "{\n"
+             "  \"requests\": {\n"
+             "    \"total\": %lu,\n"
+             "    \"successful\": %lu,\n"
+             "    \"failed\": %lu\n"
+             "  },\n"
+             "  \"cache\": {\n"
+             "    \"hits\": %lu,\n"
+             "    \"misses\": %lu,\n"
+             "    \"hit_rate_percent\": %.2f\n"
+             "  }\n"
+             "}\n",
+             total, success, failures, hits, misses, hit_rate);
+
+    char header[1024];
+    snprintf(header, sizeof(header),
+             "HTTP/1.1 200 OK\r\n"
+             "Server: %s\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %zu\r\n"
+             "Connection: close\r\n"
+             "\r\n",
+             SERVER_NAME,
+             strlen(json));
+
+    send(client_fd, header, strlen(header), 0);
+    send(client_fd, json, strlen(json), 0);
+}
+
 static void* worker_thread(void* arg) {
     (void)arg;
 
@@ -531,6 +558,13 @@ static void* worker_thread(void* arg) {
         }
 
         print_request(&req);
+
+        // Special /metrics endpoint
+        if (strcmp(req.uri, "/metrics") == 0) {
+            printf("[Worker] Serving /metrics JSON from %s:%u\n", client_ip, client_port);
+            send_metrics_json(task->client_fd);
+            goto cleanup;
+        }
 
         char full_path[1024] = {0};
         const char* document_root = "./www";
@@ -689,6 +723,8 @@ static int create_and_bind_socket(uint16_t port) {
     printf("Server starting and listening on port %u\n", port);
     return server_fd;
 }
+
+
 
 int main(void) {
     //Handlers.
