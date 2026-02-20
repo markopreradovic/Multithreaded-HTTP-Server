@@ -1,20 +1,23 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-#include <unistd.h>      // close, read, write, pause...
-#include <errno.h>       // errno, perror
-#include <signal.h>      // signal, sigaction
-#include <sys/socket.h>  // socket, bind, listen...
-#include <netinet/in.h>  // sockaddr_in, htons...
-#include <arpa/inet.h>   // inet_ntoa (for debugging later)
+#include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/epoll.h>
 #include <pthread.h>
-#include <fcntl.h>     // open, O_RDONLY
-#include <sys/stat.h>  // stat, fstat
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/sendfile.h>
+#include <sys/mman.h>
+#include <time.h>
 
 #define DEFAULT_PORT 8080
 #define BACKLOG 128
@@ -30,9 +33,11 @@
 volatile sig_atomic_t running = 1;
 
 typedef struct cache_node {
-    char* filepath;
-    char* data;
-    size_t size;
+    char* filepath;              // ključ
+    int   fd;                    // fajl descriptor (mmap-ovan)
+    void* mapped_data;           // mmap pointer
+    size_t mapped_size;          // veličina mapiranog regiona (st.st_size)
+    time_t last_access;          // za LRU (ali za sada koristimo listu)
     struct cache_node* prev;
     struct cache_node* next;
 } cache_node_t;
@@ -213,6 +218,7 @@ static void cache_move_to_head(cache_node_t* node) {
     if (cache.head) cache.head->prev = node;
     cache.head = node;
     if (!cache.tail) cache.tail = node;
+    node->last_access = time(NULL);
 }
 
 static void cache_add(cache_node_t* node) {
@@ -223,7 +229,7 @@ static void cache_add(cache_node_t* node) {
     if (!cache.tail) cache.tail = node;
 
     cache.count++;
-    cache.total_size += node->size;
+    cache.total_size += node->mapped_size;
 }
 
 static void cache_evict_lru(void) {
@@ -235,26 +241,27 @@ static void cache_evict_lru(void) {
     else cache.head = NULL;
 
     cache.count--;
-    cache.total_size -= node->size;
+    cache.total_size -= node->mapped_size;
 
     free(node->filepath);
-    free(node->data);
+    free(node->mapped_data);
     free(node);
 
     printf("[Cache] Evicted LRU entry\n");
 }
 
-static bool cache_get_or_load(const char* filepath, char** data_out, size_t* size_out) {
+static bool cache_get_or_load(const char* filepath, int* fd_out, void** mapped_out, size_t* size_out) {
     pthread_mutex_lock(&cache.mutex);
 
     cache_node_t* node = cache.head;
     while (node) {
         if (strcmp(node->filepath, filepath) == 0) {
             cache_move_to_head(node);
-            *data_out = node->data;
-            *size_out = node->size;
+            *fd_out = node->fd;
+            *mapped_out = node->mapped_data;
+            *size_out = node->mapped_size;
             pthread_mutex_unlock(&cache.mutex);
-            printf("[Cache] HIT: %s (%zu bytes)\n", filepath, node->size);
+            printf("[Cache] HIT (mmap): %s (%zu bytes)\n", filepath, node->mapped_size);
             return true;
         }
         node = node->next;
@@ -279,53 +286,49 @@ static bool cache_get_or_load(const char* filepath, char** data_out, size_t* siz
         cache_evict_lru();
     }
 
-    char* data = malloc(file_size);
-    if (!data) {
+    // mmap
+    void* mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mapped == MAP_FAILED) {
+        perror("[Cache] mmap failed");
         close(fd);
-        pthread_mutex_unlock(&cache.mutex);
-        return false;
-    }
-
-    ssize_t bytes_read = read(fd, data, file_size);
-    close(fd);
-
-    if (bytes_read != (ssize_t)file_size) {
-        free(data);
         pthread_mutex_unlock(&cache.mutex);
         return false;
     }
 
     cache_node_t* new_node = malloc(sizeof(cache_node_t));
     if (!new_node) {
-        free(data);
+        munmap(mapped, file_size);
+        close(fd);
         pthread_mutex_unlock(&cache.mutex);
         return false;
     }
 
-    new_node->filepath = strdup(filepath);
-    new_node->data = data;
-    new_node->size = file_size;
+    new_node->filepath    = strdup(filepath);
+    new_node->fd          = fd;
+    new_node->mapped_data = mapped;
+    new_node->mapped_size = file_size;
+    new_node->last_access = time(NULL);
 
     cache_add(new_node);
     pthread_mutex_unlock(&cache.mutex);
 
-    printf("[Cache] MISS → LOADED: %s (%zu bytes)\n", filepath, file_size);
+    printf("[Cache] MISS → MMAP LOADED: %s (%zu bytes)\n", filepath, file_size);
 
-    *data_out = data;
+    *fd_out = fd;
+    *mapped_out = mapped;
     *size_out = file_size;
     return true;
 }
 
-
-
 static void serve_file(int client_fd, const char* filepath) {
     printf("[serve_file] Trying: %s\n", filepath);
 
-    char* cached_data = NULL;
-    size_t cached_size = 0;
+    int mapped_fd = -1;
+    void* mapped_ptr = NULL;
+    size_t mapped_size = 0;
 
-    if (cache_get_or_load(filepath, &cached_data, &cached_size)) {
-        // Cache HIT → šaljemo iz memorije
+    if (cache_get_or_load(filepath, &mapped_fd, &mapped_ptr, &mapped_size)) {
+        // Cache HIT (mmap) → sendfile sa mmap fd-om
         char header[1024];
         snprintf(header, sizeof(header),
                  "HTTP/1.1 200 OK\r\n"
@@ -336,17 +339,24 @@ static void serve_file(int client_fd, const char* filepath) {
                  "\r\n",
                  SERVER_NAME,
                  get_content_type(filepath),
-                 cached_size);
+                 mapped_size);
 
         send(client_fd, header, strlen(header), 0);
-        send(client_fd, cached_data, cached_size, 0);
+
+        off_t offset = 0;
+        while (offset < mapped_size) {
+            ssize_t sent = sendfile(client_fd, mapped_fd, &offset, mapped_size - offset);
+            if (sent <= 0) {
+                if (sent < 0) perror("[serve_file] sendfile (cache) failed");
+                break;
+            }
+        }
         return;
     }
 
-    // Cache MISS ili greška → fallback na sendfile()
     int fd = open(filepath, O_RDONLY);
     if (fd < 0) {
-        perror("[serve_file] open failed");
+        perror("[serve_file] open fallback failed");
         send_404(client_fd);
         return;
     }
@@ -378,7 +388,7 @@ static void serve_file(int client_fd, const char* filepath) {
     while (offset < file_size) {
         ssize_t sent = sendfile(client_fd, fd, &offset, file_size - offset);
         if (sent <= 0) {
-            if (sent < 0) perror("[serve_file] sendfile failed");
+            if (sent < 0) perror("[serve_file] sendfile fallback failed");
             break;
         }
     }
@@ -391,7 +401,7 @@ static void cache_init(void) {
     cache.head = cache.tail = NULL;
     cache.count = 0;
     cache.total_size = 0;
-    printf("[Cache] Initialized (max items: %d, max size: %zu MB)\n",
+    printf("[MMAP Cache] Initialized (max items: %d, max size: %zu MB)\n",
            CACHE_MAX_ITEMS, CACHE_MAX_SIZE / (1024*1024));
 }
 
@@ -401,9 +411,14 @@ static void cache_destroy(void) {
     cache_node_t* current = cache.head;
     while (current) {
         cache_node_t* next = current->next;
+
+        if (current->mapped_data != MAP_FAILED && current->mapped_data != NULL) {
+            munmap(current->mapped_data, current->mapped_size);
+        }
+        if (current->fd >= 0) close(current->fd);
         free(current->filepath);
-        free(current->data);
         free(current);
+
         current = next;
     }
 
@@ -413,7 +428,7 @@ static void cache_destroy(void) {
 
     pthread_mutex_unlock(&cache.mutex);
     pthread_mutex_destroy(&cache.mutex);
-    printf("[Cache] Destroyed\n");
+    printf("[MMAP Cache] Destroyed\n");
 }
 
 static void* worker_thread(void* arg) {
