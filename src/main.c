@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <unistd.h>      // close, read, write, pause...
 #include <errno.h>       // errno, perror
 #include <signal.h>      // signal, sigaction
@@ -23,8 +24,28 @@
 #define MAX_HEADER_COUNT 64
 #define MAX_HEADER_LEN 512
 #define READ_BUFFER_SIZE 4096
+#define CACHE_MAX_ITEMS  100     // max number of files in cache
+#define CACHE_MAX_SIZE   (10 * 1024 * 1024)  // 10 MB max memorije
 
 volatile sig_atomic_t running = 1;
+
+typedef struct cache_node {
+    char* filepath;
+    char* data;
+    size_t size;
+    struct cache_node* prev;
+    struct cache_node* next;
+} cache_node_t;
+
+typedef struct {
+    cache_node_t* head;
+    cache_node_t* tail;
+    int count;
+    size_t total_size;
+    pthread_mutex_t mutex;
+} lru_cache_t;
+
+static lru_cache_t cache = {0};
 
 typedef struct task {
     int client_fd;
@@ -180,9 +201,149 @@ static const char* get_content_type(const char* path) {
     return "application/octet-stream";
 }
 
-static void serve_file(int client_fd, const char* filepath) {
-    printf("[serve_file] Trying to open: %s\n", filepath);
+static void cache_move_to_head(cache_node_t* node) {
+    if (node == cache.head) return;
 
+    if (node->prev) node->prev->next = node->next;
+    if (node->next) node->next->prev = node->prev;
+    if (node == cache.tail) cache.tail = node->prev;
+
+    node->next = cache.head;
+    node->prev = NULL;
+    if (cache.head) cache.head->prev = node;
+    cache.head = node;
+    if (!cache.tail) cache.tail = node;
+}
+
+static void cache_add(cache_node_t* node) {
+    node->prev = NULL;
+    node->next = cache.head;
+    if (cache.head) cache.head->prev = node;
+    cache.head = node;
+    if (!cache.tail) cache.tail = node;
+
+    cache.count++;
+    cache.total_size += node->size;
+}
+
+static void cache_evict_lru(void) {
+    if (!cache.tail) return;
+
+    cache_node_t* node = cache.tail;
+    cache.tail = node->prev;
+    if (cache.tail) cache.tail->next = NULL;
+    else cache.head = NULL;
+
+    cache.count--;
+    cache.total_size -= node->size;
+
+    free(node->filepath);
+    free(node->data);
+    free(node);
+
+    printf("[Cache] Evicted LRU entry\n");
+}
+
+static bool cache_get_or_load(const char* filepath, char** data_out, size_t* size_out) {
+    pthread_mutex_lock(&cache.mutex);
+
+    cache_node_t* node = cache.head;
+    while (node) {
+        if (strcmp(node->filepath, filepath) == 0) {
+            cache_move_to_head(node);
+            *data_out = node->data;
+            *size_out = node->size;
+            pthread_mutex_unlock(&cache.mutex);
+            printf("[Cache] HIT: %s (%zu bytes)\n", filepath, node->size);
+            return true;
+        }
+        node = node->next;
+    }
+
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0) {
+        pthread_mutex_unlock(&cache.mutex);
+        return false;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size == 0) {
+        close(fd);
+        pthread_mutex_unlock(&cache.mutex);
+        return false;
+    }
+
+    size_t file_size = st.st_size;
+
+    while (cache.count >= CACHE_MAX_ITEMS || cache.total_size + file_size > CACHE_MAX_SIZE) {
+        cache_evict_lru();
+    }
+
+    char* data = malloc(file_size);
+    if (!data) {
+        close(fd);
+        pthread_mutex_unlock(&cache.mutex);
+        return false;
+    }
+
+    ssize_t bytes_read = read(fd, data, file_size);
+    close(fd);
+
+    if (bytes_read != (ssize_t)file_size) {
+        free(data);
+        pthread_mutex_unlock(&cache.mutex);
+        return false;
+    }
+
+    cache_node_t* new_node = malloc(sizeof(cache_node_t));
+    if (!new_node) {
+        free(data);
+        pthread_mutex_unlock(&cache.mutex);
+        return false;
+    }
+
+    new_node->filepath = strdup(filepath);
+    new_node->data = data;
+    new_node->size = file_size;
+
+    cache_add(new_node);
+    pthread_mutex_unlock(&cache.mutex);
+
+    printf("[Cache] MISS → LOADED: %s (%zu bytes)\n", filepath, file_size);
+
+    *data_out = data;
+    *size_out = file_size;
+    return true;
+}
+
+
+
+static void serve_file(int client_fd, const char* filepath) {
+    printf("[serve_file] Trying: %s\n", filepath);
+
+    char* cached_data = NULL;
+    size_t cached_size = 0;
+
+    if (cache_get_or_load(filepath, &cached_data, &cached_size)) {
+        // Cache HIT → šaljemo iz memorije
+        char header[1024];
+        snprintf(header, sizeof(header),
+                 "HTTP/1.1 200 OK\r\n"
+                 "Server: %s\r\n"
+                 "Content-Type: %s\r\n"
+                 "Content-Length: %zu\r\n"
+                 "Connection: close\r\n"
+                 "\r\n",
+                 SERVER_NAME,
+                 get_content_type(filepath),
+                 cached_size);
+
+        send(client_fd, header, strlen(header), 0);
+        send(client_fd, cached_data, cached_size, 0);
+        return;
+    }
+
+    // Cache MISS ili greška → fallback na sendfile()
     int fd = open(filepath, O_RDONLY);
     if (fd < 0) {
         perror("[serve_file] open failed");
@@ -192,7 +353,6 @@ static void serve_file(int client_fd, const char* filepath) {
 
     struct stat st;
     if (fstat(fd, &st) < 0) {
-        perror("[serve_file] fstat failed");
         close(fd);
         send_404(client_fd);
         return;
@@ -200,7 +360,6 @@ static void serve_file(int client_fd, const char* filepath) {
 
     size_t file_size = st.st_size;
 
-    // Header (isti kao prije)
     char header[1024];
     snprintf(header, sizeof(header),
              "HTTP/1.1 200 OK\r\n"
@@ -213,28 +372,48 @@ static void serve_file(int client_fd, const char* filepath) {
              get_content_type(filepath),
              file_size);
 
-    if (send(client_fd, header, strlen(header), 0) < 0) {
-        perror("[serve_file] send header failed");
-        close(fd);
-        return;
-    }
+    send(client_fd, header, strlen(header), 0);
 
     off_t offset = 0;
-    ssize_t sent;
-
     while (offset < file_size) {
-        sent = sendfile(client_fd, fd, &offset, file_size - offset);
-        if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;
-            }
-            perror("[serve_file] sendfile failed");
+        ssize_t sent = sendfile(client_fd, fd, &offset, file_size - offset);
+        if (sent <= 0) {
+            if (sent < 0) perror("[serve_file] sendfile failed");
             break;
         }
-        if (sent == 0) break;
     }
 
     close(fd);
+}
+
+static void cache_init(void) {
+    pthread_mutex_init(&cache.mutex, NULL);
+    cache.head = cache.tail = NULL;
+    cache.count = 0;
+    cache.total_size = 0;
+    printf("[Cache] Initialized (max items: %d, max size: %zu MB)\n",
+           CACHE_MAX_ITEMS, CACHE_MAX_SIZE / (1024*1024));
+}
+
+static void cache_destroy(void) {
+    pthread_mutex_lock(&cache.mutex);
+
+    cache_node_t* current = cache.head;
+    while (current) {
+        cache_node_t* next = current->next;
+        free(current->filepath);
+        free(current->data);
+        free(current);
+        current = next;
+    }
+
+    cache.head = cache.tail = NULL;
+    cache.count = 0;
+    cache.total_size = 0;
+
+    pthread_mutex_unlock(&cache.mutex);
+    pthread_mutex_destroy(&cache.mutex);
+    printf("[Cache] Destroyed\n");
 }
 
 static void* worker_thread(void* arg) {
@@ -321,6 +500,8 @@ static void* worker_thread(void* arg) {
 
     return NULL;
 }
+
+
 
 static int thread_pool_init(int num_threads) {
     pool.thread_count = num_threads;
@@ -449,6 +630,7 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
+    cache_init();
     //EPOLL init
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
@@ -493,6 +675,7 @@ int main(void) {
 
     printf("\nShutting down...\n");
     close(epoll_fd);
+    cache_destroy();
     thread_pool_shutdown();
     close(server_fd);
     printf("Server closed.\n");
