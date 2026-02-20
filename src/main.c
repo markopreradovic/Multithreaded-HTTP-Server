@@ -1,6 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
-
+#pragma clang diagnostic ignored "-Wincompatible-pointer-types"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/sendfile.h>
 #include <sys/mman.h>
+#include <stdatomic.h>
 #include <time.h>
 
 #define DEFAULT_PORT 8080
@@ -31,6 +32,12 @@
 #define CACHE_MAX_SIZE   (10 * 1024 * 1024)  // 10 MB max memorije
 
 volatile sig_atomic_t running = 1;
+//Basic metrics
+static atomic_uint_fast64_t total_requests      = 0;
+static atomic_uint_fast64_t cache_hits          = 0;
+static atomic_uint_fast64_t cache_misses        = 0;
+static atomic_uint_fast64_t successful_responses = 0;  // 2xx
+static atomic_uint_fast64_t failed_responses    = 0;   // 4xx, 5xx
 
 typedef struct cache_node {
     char* filepath;              // ključ
@@ -320,7 +327,30 @@ static bool cache_get_or_load(const char* filepath, int* fd_out, void** mapped_o
     return true;
 }
 
-static void serve_file(int client_fd, const char* filepath) {
+static void metrics_increment_request(void) {
+    atomic_fetch_add(&total_requests, 1);
+}
+
+static void metrics_increment_cache_hit(void) {
+    atomic_fetch_add(&cache_hits, 1);
+}
+
+static void metrics_increment_cache_miss(void) {
+    atomic_fetch_add(&cache_misses, 1);
+}
+
+static void metrics_increment_success(void) {
+    atomic_fetch_add(&successful_responses, 1);
+}
+
+static void metrics_increment_failure(void) {
+    atomic_fetch_add(&failed_responses, 1);
+}
+
+// Serve file - returns HTTP status code (200, 404, etc.)
+static int serve_file(int client_fd, const char* filepath) {
+    metrics_increment_request();
+
     printf("[serve_file] Trying: %s\n", filepath);
 
     int mapped_fd = -1;
@@ -328,7 +358,8 @@ static void serve_file(int client_fd, const char* filepath) {
     size_t mapped_size = 0;
 
     if (cache_get_or_load(filepath, &mapped_fd, &mapped_ptr, &mapped_size)) {
-        // Cache HIT (mmap) → sendfile sa mmap fd-om
+        metrics_increment_cache_hit();
+
         char header[1024];
         snprintf(header, sizeof(header),
                  "HTTP/1.1 200 OK\r\n"
@@ -347,25 +378,27 @@ static void serve_file(int client_fd, const char* filepath) {
         while (offset < mapped_size) {
             ssize_t sent = sendfile(client_fd, mapped_fd, &offset, mapped_size - offset);
             if (sent <= 0) {
-                if (sent < 0) perror("[serve_file] sendfile (cache) failed");
+                if (sent < 0) perror("[serve_file] sendfile cache failed");
                 break;
             }
         }
-        return;
+        return 200;  // success
     }
+
+    metrics_increment_cache_miss();
 
     int fd = open(filepath, O_RDONLY);
     if (fd < 0) {
-        perror("[serve_file] open fallback failed");
+        perror("[serve_file] open failed");
         send_404(client_fd);
-        return;
+        return 404;  // not found
     }
 
     struct stat st;
     if (fstat(fd, &st) < 0) {
         close(fd);
         send_404(client_fd);
-        return;
+        return 500;  // internal error
     }
 
     size_t file_size = st.st_size;
@@ -394,6 +427,7 @@ static void serve_file(int client_fd, const char* filepath) {
     }
 
     close(fd);
+    return 200;  // success
 }
 
 static void cache_init(void) {
@@ -429,6 +463,27 @@ static void cache_destroy(void) {
     pthread_mutex_unlock(&cache.mutex);
     pthread_mutex_destroy(&cache.mutex);
     printf("[MMAP Cache] Destroyed\n");
+}
+
+
+
+static void metrics_print_summary(void) {
+    uint64_t total    = atomic_load_explicit(&total_requests,      memory_order_relaxed);
+    uint64_t hits     = atomic_load_explicit(&cache_hits,          memory_order_relaxed);
+    uint64_t misses   = atomic_load_explicit(&cache_misses,        memory_order_relaxed);
+    uint64_t success  = atomic_load_explicit(&successful_responses, memory_order_relaxed);
+    uint64_t failures = atomic_load_explicit(&failed_responses,    memory_order_relaxed);
+
+    double hit_rate = (hits + misses > 0) ? (double)hits / (hits + misses) * 100.0 : 0.0;
+
+    printf("\n[Metrics Summary]\n");
+    printf("  Total requests:     %lu\n", total);
+    printf("  Cache hits:         %lu\n", hits);
+    printf("  Cache misses:       %lu\n", misses);
+    printf("  Cache hit rate:     %.2f%%\n", hit_rate);
+    printf("  Successful (2xx):   %lu\n", success);
+    printf("  Failed (4xx/5xx):   %lu\n", failures);
+    fflush(stdout);
 }
 
 static void* worker_thread(void* arg) {
@@ -471,6 +526,7 @@ static void* worker_thread(void* arg) {
             printf("[Worker] Parse failed or connection closed early from %s:%u\n",
                    client_ip, client_port);
             send_response(task->client_fd, 400, "<h1>400 Bad Request</h1>", 23, "text/html");
+            metrics_increment_failure();
             goto cleanup;
         }
 
@@ -479,21 +535,21 @@ static void* worker_thread(void* arg) {
         char full_path[1024] = {0};
         const char* document_root = "./www";
 
-        // Osnovna zaštita – blokiramo samo opasne sekvence
+        // Basic path protection
         if (strstr(req.uri, "..") != NULL ||
             strstr(req.uri, "/.") != NULL ||
             strstr(req.uri, "\\") != NULL) {
             printf("[Worker] Forbidden path attempt: %s from %s:%u\n",
                    req.uri, client_ip, client_port);
             send_response(task->client_fd, 403, "<h1>403 Forbidden</h1>", 23, "text/html");
+            metrics_increment_failure();
             goto cleanup;
-            }
+        }
 
-        // Mapiranje URI-ja na fajl
+        // Map URI to file path
         if (strcmp(req.uri, "/") == 0 || strcmp(req.uri, "") == 0) {
             snprintf(full_path, sizeof(full_path), "%s/index.html", document_root);
         } else {
-            // Dodajemo početni / ako ga nema (ali većina klijenata šalje sa /)
             if (req.uri[0] != '/') {
                 snprintf(full_path, sizeof(full_path), "%s/%s", document_root, req.uri);
             } else {
@@ -501,11 +557,15 @@ static void* worker_thread(void* arg) {
             }
         }
 
-        // ── Serviranje ───────────────────────────────────────────────────────
         printf("[Worker] Attempting to serve: %s for URI %s from %s:%u\n",
                full_path, req.uri, client_ip, client_port);
 
-        serve_file(task->client_fd, full_path);
+        int status = serve_file(task->client_fd, full_path);
+        if (status >= 200 && status < 300) {
+            metrics_increment_success();
+        } else {
+            metrics_increment_failure();
+        }
 
     cleanup:
         free_request(&req);
@@ -686,9 +746,17 @@ int main(void) {
                 enqueue_task(client_fd, &client_addr);
             }
         }
+        static time_t last_print = 0;
+        time_t now = time(NULL);
+        if (now - last_print >= 10) {
+            metrics_print_summary();
+            last_print = now;
+        }
     }
 
+
     printf("\nShutting down...\n");
+    metrics_print_summary();
     close(epoll_fd);
     cache_destroy();
     thread_pool_shutdown();
