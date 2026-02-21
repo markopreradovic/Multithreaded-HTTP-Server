@@ -1,3 +1,5 @@
+<div align="justify">
+
 # Multithreaded High-Performance HTTP/1.1 Server in C
 
 Production-grade, concurrent HTTP/1.1 web server written entirely in pure C using modern Linux system programming techniques.
@@ -22,8 +24,9 @@ The in-memory cache uses an LRU strategy with configurable limits on maximum num
 
 The server currently supports only HTTP/1.1 and does not implement HTTP/2 or TLS. Request bodies are detected but not processed, and chunked encoding is not supported. All configuration values such as port, number of threads, cache limits, and document root are hard-coded. There is no structured logging, connection timeout handling, rate limiting, or advanced security hardening beyond basic path validation.
 
-
-
 ## Purpose
 
 This project serves as a demonstration of high-performance network programming in C, covering epoll-based I/O, thread pools, zero-copy file transfer, memory-mapped file caching, atomic metrics collection, and concurrent data structures.
+
+</div>
+
