@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <errno.h>
@@ -450,8 +451,8 @@ static void cache_init(void) {
     cache.head = cache.tail = NULL;
     cache.count = 0;
     cache.total_size = 0;
-    printf("[MMAP Cache] Initialized (max items: %d, max size: %zu MB)\n",
-           CACHE_MAX_ITEMS, CACHE_MAX_SIZE / (1024*1024));
+    printf("[MMAP Cache] Initialized (max items: %d, max size: %lu MB)\n",
+        CACHE_MAX_ITEMS, (unsigned long)(CACHE_MAX_SIZE / (1024*1024)));
 }
 
 static void cache_destroy(void) {
@@ -630,8 +631,8 @@ static void* worker_thread(void* arg) {
             goto cleanup;
         }
 
-        char full_path[1024] = {0};
-        const char* document_root = "./www";
+        char full_path[2048] = {0};
+        extern const char* document_root;
 
         // Basic path protection
         if (strstr(req.uri, "..") != NULL ||
@@ -682,6 +683,56 @@ static void* worker_thread(void* arg) {
 }
 
 
+// Simple INI parser - returns value for key or default
+static char* get_ini_value(const char* filename, const char* section, const char* key, const char* default_val) {
+    FILE* fp = fopen(filename, "r");
+    if (!fp) {
+        printf("[Config] Cannot open %s, using defaults\n", filename);
+        return strdup(default_val);
+    }
+
+    char line[256];
+    char* value = NULL;
+    int in_section = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        // Trim whitespace
+        char* p = line;
+        while (*p && isspace(*p)) p++;
+        char* end = p + strlen(p) - 1;
+        while (end >= p && isspace(*end)) *end-- = '\0';
+
+        if (*p == '[') {
+            // Section
+            char sec[64];
+            sscanf(p, "[%63[^]]]", sec);
+            in_section = (strcmp(sec, section) == 0);
+            continue;
+        }
+
+        if (!in_section) continue;
+
+        // Key = value
+        char k[64], v[128];
+        if (sscanf(p, "%63[^=] = %127[^\n]", k, v) == 2) {
+            // Trim key
+            char* kp = k;
+            while (*kp && isspace(*kp)) kp++;
+            char* kend = kp + strlen(kp) - 1;
+            while (kend >= kp && isspace(*kend)) *kend-- = '\0';
+
+            if (strcmp(kp, key) == 0) {
+                value = strdup(v);
+                break;
+            }
+        }
+    }
+
+    fclose(fp);
+
+    if (value) return value;
+    return strdup(default_val);
+}
 
 static int thread_pool_init(int num_threads) {
     pool.thread_count = num_threads;
@@ -795,42 +846,90 @@ static int create_and_bind_socket(uint16_t port) {
     return server_fd;
 }
 
-
+const char* document_root = "./www";
 
 int main(void) {
-    //Handlers.
-    signal(SIGINT, signal_handler); //Ctrl C
+    // Register signal handlers
+    signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
-    signal(SIGPIPE, SIG_IGN); //useful for writing on an closed socket
+    signal(SIGPIPE, SIG_IGN);  // Ignore broken pipe on write
 
-    //Socket binding.
-    int server_fd = create_and_bind_socket(DEFAULT_PORT);
-    if (server_fd < 0) return EXIT_FAILURE;
+    // Load configuration from server.conf
+    char* port_str       = get_ini_value("server.conf", "server", "port",          "8080");
+    char* doc_root_str = get_ini_value("server.conf", "server", "document_root", "./www");
+    char* threads_str    = get_ini_value("server.conf", "server", "thread_count",  "4");
+    char* cache_items_str = get_ini_value("server.conf", "cache", "max_items",     "100");
+    char* cache_size_str = get_ini_value("server.conf", "cache", "max_size_mb",    "10");
 
-    if (thread_pool_init(THREAD_COUNT) != 0) {
-        close(server_fd);
+    document_root = doc_root_str;
+
+
+    uint16_t port           = (uint16_t)atoi(port_str);
+    const char* document_root = doc_root_str;  // global pointer, freed at end
+    int thread_count        = atoi(threads_str);
+    int cache_max_items     = atoi(cache_items_str);
+    size_t cache_max_size   = (size_t)atoi(cache_size_str) * 1024 * 1024;
+
+    free(port_str);
+    free(threads_str);
+    free(cache_items_str);
+    free(cache_size_str);
+    // document_root freed at end of main
+
+    // Print loaded config
+    printf("Loaded configuration:\n");
+    printf("  port:            %u\n", port);
+    printf("  document_root:   %s\n", document_root);
+    printf("  thread_count:    %d\n", thread_count);
+    printf("  cache max_items: %d\n", cache_max_items);
+    printf("  cache max_size:  %zu bytes (%.1f MB)\n", cache_max_size, (double)cache_max_size / (1024*1024));
+
+    // Create and bind listening socket
+    int server_fd = create_and_bind_socket(port);
+    if (server_fd < 0) {
+        free((void*)document_root);
         return EXIT_FAILURE;
     }
 
+    // Initialize thread pool with configured number of workers
+    if (thread_pool_init(thread_count) != 0) {
+        close(server_fd);
+        free((void*)document_root);
+        return EXIT_FAILURE;
+    }
+
+    // Initialize mmap-based LRU cache
     cache_init();
-    //EPOLL init
+
+    // Initialize epoll instance
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
         perror("epoll_create1 failed");
+        cache_destroy();
         thread_pool_shutdown();
         close(server_fd);
+        free((void*)document_root);
         return EXIT_FAILURE;
     }
 
-    //adding server socket to epoll
-    struct epoll_event ev = { .events=EPOLLIN, .data.fd = server_fd};
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
+    // Add server socket to epoll (monitor for new connections)
+    struct epoll_event ev = { .events = EPOLLIN, .data.fd = server_fd };
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
+        perror("epoll_ctl ADD server_fd failed");
+        close(epoll_fd);
+        cache_destroy();
+        thread_pool_shutdown();
+        close(server_fd);
+        free((void*)document_root);
+        return EXIT_FAILURE;
+    }
 
     struct epoll_event events[MAX_EVENTS];
 
-    printf("Server running on port %d with %d workers. Press Ctrl+C to shut down.\n", DEFAULT_PORT, THREAD_COUNT);
+    printf("Server running on port %u with %d workers. Press Ctrl+C to shut down.\n", port, thread_count);
     fflush(stdout);
 
+    // Main event loop
     while (running) {
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
         if (nfds < 0) {
@@ -853,6 +952,8 @@ int main(void) {
                 enqueue_task(client_fd, &client_addr);
             }
         }
+
+        // Print metrics summary every 10 seconds
         static time_t last_print = 0;
         time_t now = time(NULL);
         if (now - last_print >= 10) {
@@ -861,14 +962,19 @@ int main(void) {
         }
     }
 
-
+    // Graceful shutdown
     printf("\nShutting down...\n");
+
+    // Final metrics summary before exit
     metrics_print_summary();
+
     close(epoll_fd);
     cache_destroy();
     thread_pool_shutdown();
     close(server_fd);
-    printf("Server closed.\n");
+    free((void*)document_root);
 
+    printf("Server closed.\n");
+    free((void*)doc_root_str);
     return EXIT_SUCCESS;
 }
