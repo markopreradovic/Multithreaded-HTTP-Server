@@ -1,1036 +1,107 @@
-#define _POSIX_C_SOURCE 200809L
-#define _GNU_SOURCE
-#pragma clang diagnostic ignored "-Wincompatible-pointer-types"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <ctype.h>
-#include <stdbool.h>
-#include <unistd.h>
-#include <sys/wait.h>   // waitpid
-#include <errno.h>
-#include <signal.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/epoll.h>
-#include <pthread.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/sendfile.h>
-#include <sys/mman.h>
-#include <stdatomic.h>
-#include <time.h>
-
-#define LATENCY_BUCKETS 10
-#define DEFAULT_PORT 8080
-#define BACKLOG 128
-#define MAX_EVENTS 64
-#define SERVER_NAME "CServer/0.1"
-#define THREAD_COUNT 4 //worker threads
-#define MAX_HEADER_COUNT 64
-#define MAX_HEADER_LEN 512
-#define READ_BUFFER_SIZE 4096
-#define CACHE_MAX_ITEMS  100     // max number of files in cache
-#define CACHE_MAX_SIZE   (10 * 1024 * 1024)  // 10 MB max memorije
-
-volatile sig_atomic_t running = 1;
-//Basic metrics
-static atomic_uint_fast64_t total_requests      = 0;
-static atomic_uint_fast64_t cache_hits          = 0;
-static atomic_uint_fast64_t cache_misses        = 0;
-static atomic_uint_fast64_t successful_responses = 0;  // 2xx
-static atomic_uint_fast64_t failed_responses    = 0;   // 4xx, 5xx
-static atomic_uint_fast64_t latency_buckets[LATENCY_BUCKETS] = {0};
-//For p50/p95/p99 approximation (simple, not exact)
-static atomic_uint_fast64_t latency_sum_us = 0;          // total microseconds
-static atomic_uint_fast64_t latency_count = 0;           // number of measured requests
-
-typedef struct cache_node {
-    char* filepath;              // ključ
-    int   fd;                    // fajl descriptor (mmap-ovan)
-    void* mapped_data;           // mmap pointer
-    size_t mapped_size;          // veličina mapiranog regiona (st.st_size)
-    time_t last_access;          // za LRU (ali za sada koristimo listu)
-    struct cache_node* prev;
-    struct cache_node* next;
-} cache_node_t;
-
-typedef struct {
-    cache_node_t* head;
-    cache_node_t* tail;
-    int count;
-    size_t total_size;
-    pthread_mutex_t mutex;
-} lru_cache_t;
-
-static lru_cache_t cache = {0};
-
-typedef struct task {
-    int client_fd;
-    struct sockaddr_in client_addr;
-    struct task *next;
-} task_t;
-
-typedef struct {
-    pthread_t* threads;
-    int thread_count;
-    task_t *queue_head;
-    task_t *queue_tail;
-    pthread_mutex_t queue_mutex;
-    pthread_cond_t queue_cond;
-    volatile int shutdown;
-} thread_pool_t;
-
-typedef struct {
-    char method[16];
-    char uri[1024];  //index.html?param=1
-    char version[16]; //1.1
-    char headers[MAX_HEADER_COUNT][MAX_HEADER_LEN];
-    int header_count;
-    size_t content_length;
-    char *body;
-} http_request_t;
-
-static void free_request(http_request_t *req) {
-    if (req->body) free(req->body);
-    memset(req,0,sizeof(*req));
-}
-
-static int parse_request(int client_fd, http_request_t *req) {
-    char buffer[READ_BUFFER_SIZE];
-    ssize_t total_read = 0;
-    ssize_t n;
-
-    memset(req,0,sizeof(*req));
-
-    //Reading until \r\n\r\n
-    while (total_read < (ssize_t)(sizeof(buffer) - 1))  {
-        n = recv(client_fd, buffer + total_read, sizeof(buffer) - total_read - 1, 0);
-        if (n <= 0) {
-            if (n == 0) printf("[Parser] Connection closed by client\n");
-            else        perror("[Parser] recv");
-            return -1;
-        }
-
-        total_read += n;
-        buffer[total_read] = '\0';
-
-        if (strstr(buffer, "\r\n\r\n")) {
-            break;
-        }
-    }
-
-    if (total_read == 0) return -1;
-
-    char* line = strtok(buffer, "\r\n");
-    if (!line) return -1;
-
-    if (sscanf(line, "%15s %1023s %15s", req->method, req->uri, req->version) != 3) {
-        printf("[Parser] Invalid request line: %s\n", line);
-        return -1;
-    }
-
-    //Header parsing
-    while ((line = strtok(NULL, "\r\n")) != NULL && strlen(line) > 0) {
-        if (req->header_count >= MAX_HEADER_COUNT) break;
-
-        strncpy(req->headers[req->header_count], line, MAX_HEADER_LEN - 1);
-        req->headers[req->header_count][MAX_HEADER_LEN - 1] = '\0';
-        req->header_count++;
-
-        if (strncasecmp(line, "Content-Length:", 15) == 0) {
-            req->content_length = strtoul(line + 15, NULL, 10);
-        }
-    }
-    return 0;
-}
-
-static void print_request(const http_request_t* req) {
-    printf("[Worker] Parsed request:\n");
-    printf("  Method: %s\n", req->method);
-    printf("  URI:    %s\n", req->uri);
-    printf("  Version:%s\n", req->version);
-    printf("  Headers (%d):\n", req->header_count);
-
-    for (int i = 0; i < req->header_count; i++) {
-        printf("    %s\n", req->headers[i]);
-    }
-
-    if (req->content_length > 0) {
-        printf("  Body expected: %zu bytes\n", req->content_length);
-    }
-    fflush(stdout);
-}
-
-// Send generic HTTP response
-static void send_response(int client_fd, int status, const char* body, size_t body_len, const char* content_type) {
-    char header[1024];
-    const char* status_text = (status == 200) ? "OK" :
-                              (status == 404) ? "Not Found" :
-                              "Bad Request";
-
-    snprintf(header, sizeof(header),
-             "HTTP/1.1 %d %s\r\n"
-             "Server: %s\r\n"
-             "Content-Type: %s\r\n"
-             "Content-Length: %zu\r\n"
-             "Connection: close\r\n"   // keep-alive handled in worker loop
-             "\r\n",
-             status, status_text,
-             SERVER_NAME,
-             content_type,
-             body_len);
-
-    send(client_fd, header, strlen(header), 0);
-    if (body && body_len > 0) send(client_fd, body, body_len, 0);
-}
-
-static void send_404(int client_fd) {
-    const char* body =
-        "<!DOCTYPE html>\n"
-        "<html><head><title>404 Not Found</title></head>\n"
-        "<body><h1>404 Not Found</h1><p>The requested resource was not found on this server.</p></body></html>";
-
-    send_response(client_fd, 404, body, strlen(body), "text/html; charset=utf-8");
-}
-
-static thread_pool_t pool = {0};
-
-static const char* get_content_type(const char* path) {
-    const char* ext = strrchr(path, '.');
-    if (!ext) return "application/octet-stream";
-
-    if (strcasecmp(ext, ".html") == 0 || strcasecmp(ext, ".htm") == 0) return "text/html; charset=utf-8";
-    if (strcasecmp(ext, ".css")  == 0) return "text/css; charset=utf-8";
-    if (strcasecmp(ext, ".txt")  == 0) return "text/plain; charset=utf-8";
-    if (strcasecmp(ext, ".jpg")  == 0 || strcasecmp(ext, ".jpeg") == 0) return "image/jpeg";
-    if (strcasecmp(ext, ".png")  == 0) return "image/png";
-    if (strcasecmp(ext, ".gif")  == 0) return "image/gif";
-
-    return "application/octet-stream";
-}
-
-static void cache_move_to_head(cache_node_t* node) {
-    if (node == cache.head) return;
-
-    if (node->prev) node->prev->next = node->next;
-    if (node->next) node->next->prev = node->prev;
-    if (node == cache.tail) cache.tail = node->prev;
-
-    node->next = cache.head;
-    node->prev = NULL;
-    if (cache.head) cache.head->prev = node;
-    cache.head = node;
-    if (!cache.tail) cache.tail = node;
-    node->last_access = time(NULL);
-}
-
-static void cache_add(cache_node_t* node) {
-    node->prev = NULL;
-    node->next = cache.head;
-    if (cache.head) cache.head->prev = node;
-    cache.head = node;
-    if (!cache.tail) cache.tail = node;
-
-    cache.count++;
-    cache.total_size += node->mapped_size;
-}
-
-static void cache_evict_lru(void) {
-    if (!cache.tail) return;
-
-    cache_node_t* node = cache.tail;
-    cache.tail = node->prev;
-    if (cache.tail) cache.tail->next = NULL;
-    else cache.head = NULL;
-
-    cache.count--;
-    cache.total_size -= node->mapped_size;
-
-    free(node->filepath);
-    free(node->mapped_data);
-    free(node);
-
-    printf("[Cache] Evicted LRU entry\n");
-}
-
-static bool cache_get_or_load(const char* filepath, int* fd_out, void** mapped_out, size_t* size_out) {
-    pthread_mutex_lock(&cache.mutex);
-
-    cache_node_t* node = cache.head;
-    while (node) {
-        if (strcmp(node->filepath, filepath) == 0) {
-            cache_move_to_head(node);
-            *fd_out = node->fd;
-            *mapped_out = node->mapped_data;
-            *size_out = node->mapped_size;
-            pthread_mutex_unlock(&cache.mutex);
-            printf("[Cache] HIT (mmap): %s (%zu bytes)\n", filepath, node->mapped_size);
-            return true;
-        }
-        node = node->next;
-    }
-
-    int fd = open(filepath, O_RDONLY);
-    if (fd < 0) {
-        pthread_mutex_unlock(&cache.mutex);
-        return false;
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) < 0 || st.st_size == 0) {
-        close(fd);
-        pthread_mutex_unlock(&cache.mutex);
-        return false;
-    }
-
-    size_t file_size = st.st_size;
-
-    while (cache.count >= CACHE_MAX_ITEMS || cache.total_size + file_size > CACHE_MAX_SIZE) {
-        cache_evict_lru();
-    }
-
-    // mmap
-    void* mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (mapped == MAP_FAILED) {
-        perror("[Cache] mmap failed");
-        close(fd);
-        pthread_mutex_unlock(&cache.mutex);
-        return false;
-    }
-
-    cache_node_t* new_node = malloc(sizeof(cache_node_t));
-    if (!new_node) {
-        munmap(mapped, file_size);
-        close(fd);
-        pthread_mutex_unlock(&cache.mutex);
-        return false;
-    }
-
-    new_node->filepath    = strdup(filepath);
-    new_node->fd          = fd;
-    new_node->mapped_data = mapped;
-    new_node->mapped_size = file_size;
-    new_node->last_access = time(NULL);
-
-    cache_add(new_node);
-    pthread_mutex_unlock(&cache.mutex);
-
-    printf("[Cache] MISS → MMAP LOADED: %s (%zu bytes)\n", filepath, file_size);
-
-    *fd_out = fd;
-    *mapped_out = mapped;
-    *size_out = file_size;
-    return true;
-}
-
-static void metrics_increment_request(void) {
-    atomic_fetch_add(&total_requests, 1);
-}
-
-static void metrics_increment_cache_hit(void) {
-    atomic_fetch_add(&cache_hits, 1);
-}
-
-static void metrics_increment_cache_miss(void) {
-    atomic_fetch_add(&cache_misses, 1);
-}
-
-static void metrics_increment_success(void) {
-    atomic_fetch_add(&successful_responses, 1);
-}
-
-static void metrics_increment_failure(void) {
-    atomic_fetch_add(&failed_responses, 1);
-}
-
-// Serve file - returns HTTP status code (200, 404, etc.)
-static int serve_file(int client_fd, const char* filepath) {
-    metrics_increment_request();
-
-    printf("[serve_file] Trying: %s\n", filepath);
-
-    int mapped_fd = -1;
-    void* mapped_ptr = NULL;
-    size_t mapped_size = 0;
-
-    if (cache_get_or_load(filepath, &mapped_fd, &mapped_ptr, &mapped_size)) {
-        metrics_increment_cache_hit();
-
-        char header[1024];
-        snprintf(header, sizeof(header),
-                 "HTTP/1.1 200 OK\r\n"
-                 "Server: %s\r\n"
-                 "Content-Type: %s\r\n"
-                 "Content-Length: %zu\r\n"
-                 "Connection: close\r\n"  // keep-alive handled in loop
-                 "\r\n",
-                 SERVER_NAME,
-                 get_content_type(filepath),
-                 mapped_size);
-
-        send(client_fd, header, strlen(header), 0);
-
-        off_t offset = 0;
-        while (offset < mapped_size) {
-            ssize_t sent = sendfile(client_fd, mapped_fd, &offset, mapped_size - offset);
-            if (sent <= 0) {
-                if (sent < 0) perror("[serve_file] sendfile cache failed");
-                break;
-            }
-        }
-        return 200;
-    }
-
-    metrics_increment_cache_miss();
-
-    int fd = open(filepath, O_RDONLY);
-    if (fd < 0) {
-        perror("[serve_file] open failed");
-        send_404(client_fd);
-        return 404;
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        close(fd);
-        send_404(client_fd);
-        return 500;
-    }
-
-    size_t file_size = st.st_size;
-
-    char header[1024];
-    snprintf(header, sizeof(header),
-             "HTTP/1.1 200 OK\r\n"
-             "Server: %s\r\n"
-             "Content-Type: %s\r\n"
-             "Content-Length: %zu\r\n"
-             "Connection: close\r\n"
-             "\r\n",
-             SERVER_NAME,
-             get_content_type(filepath),
-             file_size);
-
-    send(client_fd, header, strlen(header), 0);
-
-    off_t offset = 0;
-    while (offset < file_size) {
-        ssize_t sent = sendfile(client_fd, fd, &offset, file_size - offset);
-        if (sent <= 0) {
-            if (sent < 0) perror("[serve_file] sendfile fallback failed");
-            break;
-        }
-    }
-
-    close(fd);
-    return 200;
-}
-
-// Record latency in microseconds
-static void metrics_record_latency(uint64_t start_ns) {
-    struct timespec end;
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    uint64_t end_ns = end.tv_sec * 1000000000ULL + end.tv_nsec;
-    uint64_t duration_ns = end_ns - start_ns;
-    uint64_t duration_us = duration_ns / 1000;
-
-    // Update sum and count
-    atomic_fetch_add(&latency_sum_us, duration_us);
-    atomic_fetch_add(&latency_count, 1);
-
-    // Bucket it
-    int bucket;
-    if (duration_us < 1000) bucket = 0;           // <1ms
-    else if (duration_us < 5000) bucket = 1;      // 1-5ms
-    else if (duration_us < 10000) bucket = 2;     // 5-10ms
-    else if (duration_us < 50000) bucket = 3;     // 10-50ms
-    else if (duration_us < 100000) bucket = 4;    // 50-100ms
-    else bucket = 5;                               // >100ms
-
-    atomic_fetch_add(&latency_buckets[bucket], 1);
-}
-
-static void cache_init(void) {
-    pthread_mutex_init(&cache.mutex, NULL);
-    cache.head = cache.tail = NULL;
-    cache.count = 0;
-    cache.total_size = 0;
-    printf("[MMAP Cache] Initialized (max items: %d, max size: %lu MB)\n",
-        CACHE_MAX_ITEMS, (unsigned long)(CACHE_MAX_SIZE / (1024*1024)));
-}
-
-static void cache_destroy(void) {
-    pthread_mutex_lock(&cache.mutex);
-
-    cache_node_t* current = cache.head;
-    while (current) {
-        cache_node_t* next = current->next;
-
-        if (current->mapped_data != MAP_FAILED && current->mapped_data != NULL) {
-            munmap(current->mapped_data, current->mapped_size);
-        }
-        if (current->fd >= 0) close(current->fd);
-        free(current->filepath);
-        free(current);
-
-        current = next;
-    }
-
-    cache.head = cache.tail = NULL;
-    cache.count = 0;
-    cache.total_size = 0;
-
-    pthread_mutex_unlock(&cache.mutex);
-    pthread_mutex_destroy(&cache.mutex);
-    printf("[MMAP Cache] Destroyed\n");
-}
-
-
-
-static void metrics_print_summary(void) {
-    uint64_t total    = atomic_load_explicit(&total_requests,      memory_order_relaxed);
-    uint64_t hits     = atomic_load_explicit(&cache_hits,          memory_order_relaxed);
-    uint64_t misses   = atomic_load_explicit(&cache_misses,        memory_order_relaxed);
-    uint64_t success  = atomic_load_explicit(&successful_responses, memory_order_relaxed);
-    uint64_t failures = atomic_load_explicit(&failed_responses,    memory_order_relaxed);
-
-    double hit_rate = (hits + misses > 0) ? (double)hits / (hits + misses) * 100.0 : 0.0;
-
-    uint64_t count = atomic_load_explicit(&latency_count, memory_order_relaxed);
-    uint64_t sum_us = atomic_load_explicit(&latency_sum_us, memory_order_relaxed);
-    double avg_latency_ms = count > 0 ? (double)sum_us / count / 1000.0 : 0.0;
-
-    // Simple p50/p95/p99 approximation (not exact, but good enough)
-    uint64_t cumulative = 0;
-    double p50 = 0, p95 = 0, p99 = 0;
-    if (count > 0) {
-        uint64_t p50_target = count * 50 / 100;
-        uint64_t p95_target = count * 95 / 100;
-        uint64_t p99_target = count * 99 / 100;
-
-        for (int i = 0; i < LATENCY_BUCKETS; i++) {
-            cumulative += atomic_load_explicit(&latency_buckets[i], memory_order_relaxed);
-            if (p50 == 0 && cumulative >= p50_target) p50 = i * 10;  // rough bucket mid
-            if (p95 == 0 && cumulative >= p95_target) p95 = i * 10;
-            if (p99 == 0 && cumulative >= p99_target) p99 = i * 10;
-        }
-    }
-
-    printf("\n[Metrics Summary]\n");
-    printf("  Total requests:     %lu\n", total);
-    printf("  Cache hits:         %lu\n", hits);
-    printf("  Cache misses:       %lu\n", misses);
-    printf("  Cache hit rate:     %.2f%%\n", hit_rate);
-    printf("  Successful (2xx):   %lu\n", success);
-    printf("  Failed (4xx/5xx):   %lu\n", failures);
-    printf("  Avg latency:        %.2f ms\n", avg_latency_ms);
-    printf("  Latency p50:        ~%.0f ms\n", p50);
-    printf("  Latency p95:        ~%.0f ms\n", p95);
-    printf("  Latency p99:        ~%.0f ms\n", p99);
-    fflush(stdout);
-}
-
-// Simple JSON metrics response
-static void send_metrics_json(int client_fd, bool keep_alive) {
-    uint64_t total    = atomic_load_explicit(&total_requests,      memory_order_relaxed);
-    uint64_t hits     = atomic_load_explicit(&cache_hits,          memory_order_relaxed);
-    uint64_t misses   = atomic_load_explicit(&cache_misses,        memory_order_relaxed);
-    uint64_t success  = atomic_load_explicit(&successful_responses, memory_order_relaxed);
-    uint64_t failures = atomic_load_explicit(&failed_responses,    memory_order_relaxed);
-
-    double hit_rate = (hits + misses > 0) ? (double)hits / (hits + misses) * 100.0 : 0.0;
-
-    char json[2048];
-    snprintf(json, sizeof(json),
-             "{\n"
-             "  \"requests\": {\n"
-             "    \"total\": %lu,\n"
-             "    \"successful\": %lu,\n"
-             "    \"failed\": %lu\n"
-             "  },\n"
-             "  \"cache\": {\n"
-             "    \"hits\": %lu,\n"
-             "    \"misses\": %lu,\n"
-             "    \"hit_rate_percent\": %.2f\n"
-             "  }\n"
-             "}\n",
-             total, success, failures, hits, misses, hit_rate);
-
-    char header[1024];
-    snprintf(header, sizeof(header),
-             "HTTP/1.1 200 OK\r\n"
-             "Server: %s\r\n"
-             "Content-Type: application/json\r\n"
-             "Content-Length: %zu\r\n"
-             "Connection: %s\r\n"
-             "\r\n",
-             SERVER_NAME,
-             strlen(json),
-             keep_alive ? "keep-alive" : "close");
-
-    send(client_fd, header, strlen(header), 0);
-    send(client_fd, json, strlen(json), 0);
-}
-const char* document_root = "./www";
-
-// Check if client wants keep-alive
-static bool is_keep_alive(const http_request_t* req) {
-    for (int i = 0; i < req->header_count; i++) {
-        if (strncasecmp(req->headers[i], "Connection:", 11) == 0) {
-            const char* val = req->headers[i] + 11;
-            while (*val && isspace(*val)) val++;
-            if (strncasecmp(val, "keep-alive", 10) == 0) {
-                return true;
-            }
-        }
-    }
-    return false;  // default close for HTTP/1.0 or explicit close
-}
-
-static int execute_cgi(int client_fd, const char* script_path, const http_request_t* req);
-
-// Worker thread - main request processing loop with keep-alive support
-static void* worker_thread(void* arg) {
-    (void)arg;
-
-    while (1) {
-        task_t* task = NULL;
-
-        pthread_mutex_lock(&pool.queue_mutex);
-
-        while (pool.queue_head == NULL && !pool.shutdown) {
-            pthread_cond_wait(&pool.queue_cond, &pool.queue_mutex);
-        }
-
-        if (pool.shutdown) {
-            pthread_mutex_unlock(&pool.queue_mutex);
-            return NULL;
-        }
-
-        task = pool.queue_head;
-        pool.queue_head = task->next;
-        if (pool.queue_head == NULL) {
-            pool.queue_tail = NULL;
-        }
-
-        pthread_mutex_unlock(&pool.queue_mutex);
-
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &task->client_addr.sin_addr, client_ip, sizeof(client_ip));
-
-        uint16_t client_port = ntohs(task->client_addr.sin_port);
-
-        printf("[Worker] Processing connection from %s:%u (fd=%d)\n",
-               client_ip, client_port, task->client_fd);
-
-        http_request_t req;
-        memset(&req, 0, sizeof(req));
-
-        if (parse_request(task->client_fd, &req) != 0) {
-            printf("[Worker] Parse failed or connection closed early from %s:%u\n",
-                   client_ip, client_port);
-            send_response(task->client_fd, 400, "<h1>400 Bad Request</h1>", 23, "text/html");
-            goto cleanup;
-        }
-
-        print_request(&req);
-
-        char full_path[1024] = {0};
-        const char* document_root = "./www";
-
-        if (strstr(req.uri, "..") != NULL ||
-            strstr(req.uri, "/.") != NULL ||
-            strstr(req.uri, "\\") != NULL) {
-            printf("[Worker] Forbidden path attempt: %s from %s:%u\n",
-                   req.uri, client_ip, client_port);
-            send_response(task->client_fd, 403, "<h1>403 Forbidden</h1>", 23, "text/html");
-            goto cleanup;
-        }
-
-        char uri_path[1024];
-        char* q = strchr(req.uri, '?');
-        if (q) {
-            size_t len = q - req.uri;
-            strncpy(uri_path, req.uri, len);
-            uri_path[len] = '\0';
-        } else {
-            strncpy(uri_path, req.uri, sizeof(uri_path) - 1);
-            uri_path[sizeof(uri_path) - 1] = '\0';
-        }
-
-        if (strcmp(uri_path, "/") == 0 || strcmp(uri_path, "") == 0 || strcmp(uri_path, "/index.html") == 0) {
-            snprintf(full_path, sizeof(full_path), "%s/index.html", document_root);
-        } else {
-            snprintf(full_path, sizeof(full_path), "%s%s", document_root, uri_path);
-        }
-
-        // Check for CGI extension
-        const char* ext = strrchr(full_path, '.');
-        if (ext && strcasecmp(ext, ".cgi") == 0) {
-            printf("[Worker] Executing CGI: %s for URI %s from %s:%u\n",
-                   full_path, req.uri, client_ip, client_port);
-            execute_cgi(task->client_fd, full_path, &req);
-            goto cleanup;
-        }
-
-        printf("[Worker] Attempting to serve: %s for URI %s from %s:%u\n",
-               full_path, req.uri, client_ip, client_port);
-
-        serve_file(task->client_fd, full_path);
-
-    cleanup:
-        free_request(&req);
-        close(task->client_fd);
-        free(task);
-    }
-
-    return NULL;
-}
-
-
-// Simple INI parser - returns value for key or default
-static char* get_ini_value(const char* filename, const char* section, const char* key, const char* default_val) {
-    FILE* fp = fopen(filename, "r");
-    if (!fp) {
-        printf("[Config] Cannot open %s, using defaults\n", filename);
-        return strdup(default_val);
-    }
-
-    char line[256];
-    char* value = NULL;
-    int in_section = 0;
-
-    while (fgets(line, sizeof(line), fp)) {
-        // Trim whitespace
-        char* p = line;
-        while (*p && isspace(*p)) p++;
-        char* end = p + strlen(p) - 1;
-        while (end >= p && isspace(*end)) *end-- = '\0';
-
-        if (*p == '[') {
-            // Section
-            char sec[64];
-            sscanf(p, "[%63[^]]]", sec);
-            in_section = (strcmp(sec, section) == 0);
-            continue;
-        }
-
-        if (!in_section) continue;
-
-        // Key = value
-        char k[64], v[128];
-        if (sscanf(p, "%63[^=] = %127[^\n]", k, v) == 2) {
-            // Trim key
-            char* kp = k;
-            while (*kp && isspace(*kp)) kp++;
-            char* kend = kp + strlen(kp) - 1;
-            while (kend >= kp && isspace(*kend)) *kend-- = '\0';
-
-            if (strcmp(kp, key) == 0) {
-                value = strdup(v);
-                break;
-            }
-        }
-    }
-
-    fclose(fp);
-
-    if (value) return value;
-    return strdup(default_val);
-}
-
-static int thread_pool_init(int num_threads) {
-    pool.thread_count = num_threads;
-    pool.threads = malloc(num_threads * sizeof(pthread_t));
-    if (!pool.threads) return -1;
-
-    pthread_mutex_init(&pool.queue_mutex, NULL);
-    pthread_cond_init(&pool.queue_cond, NULL);
-
-    pool.queue_head = pool.queue_tail = NULL;
-    pool.shutdown = 0;
-
-    for (int i=0; i<num_threads; i++) {
-        if (pthread_create(&pool.threads[i], NULL, worker_thread, NULL) != 0) {
-            fprintf(stderr, "Failed to create worker thread %d\n", i);
-            // cleanup...
-            return -1;
-        }
-    }
-
-    printf("Thread pool started with %d workers\n", num_threads);
-    return 0;
-}
-
-static void thread_pool_shutdown() {
-    pthread_mutex_lock(&pool.queue_mutex);
-    pool.shutdown = 1;
-    pthread_cond_broadcast(&pool.queue_cond);
-    pthread_mutex_unlock(&pool.queue_mutex);
-
-    for (int i = 0; i < pool.thread_count; i++) {
-        pthread_join(pool.threads[i], NULL);
-    }
-
-    free(pool.threads);
-    task_t* current = pool.queue_head;
-    while (current) {
-        task_t* next = current->next;
-        close(current->client_fd);
-        free(current);
-        current = next;
-    }
-    pthread_mutex_destroy(&pool.queue_mutex);
-    pthread_cond_destroy(&pool.queue_cond);
-}
-
-static void enqueue_task(int client_fd, struct sockaddr_in* client_addr) {
-    task_t* task = malloc(sizeof(task_t));
-    if (!task) {
-        close(client_fd);
-        return;
-    }
-
-    task->client_fd = client_fd;
-    task->client_addr = *client_addr;
-    task->next = NULL;
-
-    pthread_mutex_lock(&pool.queue_mutex);
-
-    if (pool.queue_tail) {
-        pool.queue_tail->next = task;
-    } else {
-        pool.queue_head = task;
-    }
-    pool.queue_tail = task;
-
-    pthread_cond_signal(&pool.queue_cond);
-    pthread_mutex_unlock(&pool.queue_mutex);
-}
-
-static void signal_handler(int sig) {
-    (void) sig;
-    running = 0;
-}
-
-static int create_and_bind_socket(uint16_t port) {
-    //Creating TCP socket (IPv4)
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("socket failed");
-        return -1;
-    }
-
-    //Enabling the port to be used right after shutdown (without it there will be 3 to 4 minutes wait time)
-    int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt SO_REUSEADDR");
-        close(server_fd);
-        return -1;
-    }
-
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;          //IPv4
-    addr.sin_addr.s_addr = INADDR_ANY;  // 0.0.0.0 - All network interfaces
-    addr.sin_port = htons(port);        // Converting port to network byte order
-
-    // Connecting socket with an address and port
-    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind failed");
-        close(server_fd);
-        return -1;
-    }
-
-    //Listening to upcoming connections (BACKLOG = how many connections can wait in queue before being refused)
-    if(listen(server_fd, BACKLOG) < 0) {
-        perror("listen failed");
-        close(server_fd);
-        return -1;
-    }
-    printf("Server starting and listening on port %u\n", port);
-    return server_fd;
-}
-
-
-// Execute CGI script and pipe output to client
-// Execute CGI script and pipe output to client
-static int execute_cgi(int client_fd, const char* script_path, const http_request_t* req) {
-    int pipefd[2];
-    if (pipe(pipefd) < 0) {
-        perror("[CGI] pipe failed");
-        send_response(client_fd, 500, "<h1>500 Internal Server Error</h1>", 35, "text/html");
-        return 500;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("[CGI] fork failed");
-        close(pipefd[0]);
-        close(pipefd[1]);
-        send_response(client_fd, 500, "<h1>500 Internal Server Error</h1>", 35, "text/html");
-        return 500;
-    }
-
-    if (pid == 0) {  // Child process
-        close(pipefd[0]);               // Close read end
-        dup2(pipefd[1], STDOUT_FILENO); // Redirect stdout to pipe
-        close(pipefd[1]);
-
-        // Build environment array (max 10 vars for simplicity)
-        char* env[16] = {0};
-        int idx = 0;
-
-        env[idx++] = "GATEWAY_INTERFACE=CGI/1.1";
-        env[idx++] = "SERVER_NAME=CServer/0.1";
-        env[idx++] = "SERVER_PORT=9090";
-        env[idx++] = "SCRIPT_NAME=/hello.cgi";  // hard-coded for now
-
-        // REQUEST_METHOD from request
-        char method_env[64];
-        snprintf(method_env, sizeof(method_env), "REQUEST_METHOD=%s", req->method);
-        env[idx++] = method_env;
-
-        // PATH_INFO = full URI
-        char path_env[1024];
-        snprintf(path_env, sizeof(path_env), "PATH_INFO=%s", req->uri);
-        env[idx++] = path_env;
-
-        // QUERY_STRING if present
-        char* q = strchr(req->uri, '?');
-        char query_env[1024] = "QUERY_STRING=";
-        if (q) {
-            strcat(query_env, q + 1);
-        }
-        env[idx++] = query_env;
-
-        // End of env array
-        env[idx] = NULL;
-
-        char* argv[] = { (char*)script_path, NULL };
-
-        execve(script_path, argv, env);
-        perror("[CGI] execve failed");
-        exit(1);
-    }
-
-    // Parent process
-    close(pipefd[1]);  // Close write end
-
-    // Send default HTTP header (since script may not send it)
-    const char* default_header = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
-    send(client_fd, default_header, strlen(default_header), 0);
-
-    // Read script output from pipe and forward to client
-    char buffer[4096];
-    ssize_t bytes;
-    while ((bytes = read(pipefd[0], buffer, sizeof(buffer))) > 0) {
-        send(client_fd, buffer, bytes, 0);
-    }
-
-    close(pipefd[0]);
-
-    // Wait for child and check exit status
-    int status;
-    waitpid(pid, &status, 0);
-
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        return 200;
-    } else {
-        send_response(client_fd, 500, "<h1>500 CGI Script Error</h1>", 30, "text/html");
-        return 500;
-    }
-}
-
+#include "common.h"
+#include "config.h"
+#include "logger.h"
+#include "cache.h"
+#include "metrics.h"
+#include "http.h"
+#include "thread_pool.h"
+#include "server.h"
 
 int main(void) {
-    // Register signal handlers
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
-    signal(SIGPIPE, SIG_IGN);  // Ignore broken pipe on write
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGHUP,  signal_handler);
 
-    // Load configuration from server.conf
-    char* port_str       = get_ini_value("server.conf", "server", "port",          "8080");
-    char* doc_root_str = get_ini_value("server.conf", "server", "document_root", "./www");
-    char* threads_str    = get_ini_value("server.conf", "server", "thread_count",  "4");
-    char* cache_items_str = get_ini_value("server.conf", "cache", "max_items",     "100");
-    char* cache_size_str = get_ini_value("server.conf", "cache", "max_size_mb",    "10");
+    char* port_str        = get_ini_value("server.conf", "server",  "port",          "8080");
+    char* doc_root_str    = get_ini_value("server.conf", "server",  "document_root", "./www");
+    char* threads_str     = get_ini_value("server.conf", "server",  "thread_count",  "4");
+    char* cache_items_str = get_ini_value("server.conf", "cache",   "max_items",     "100");
+    char* cache_size_str  = get_ini_value("server.conf", "cache",   "max_size_mb",   "10");
+    char* log_level_str   = get_ini_value("server.conf", "logging", "level",         "INFO");
 
-    document_root = doc_root_str;
+    uint16_t    port           = (uint16_t)atoi(port_str);
+    document_root              = doc_root_str;
+    int         thread_count   = atoi(threads_str);
+    int         cache_max_items __attribute__((unused)) = atoi(cache_items_str);
+    size_t      cache_max_size  __attribute__((unused)) =
+                    (size_t)atoi(cache_size_str) * 1024 * 1024;
 
+    if (strcasecmp(log_level_str, "ERROR") == 0)
+        current_log_level = LOG_ERROR;
+    else
+        current_log_level = LOG_INFO;
 
-    uint16_t port           = (uint16_t)atoi(port_str);
-    const char* document_root = doc_root_str;  // global pointer, freed at end
-    int thread_count        = atoi(threads_str);
-    int cache_max_items     = atoi(cache_items_str);
-    size_t cache_max_size   = (size_t)atoi(cache_size_str) * 1024 * 1024;
+    log_file = fopen(log_file_path, "a");
+    if (!log_file)
+        log_message(LOG_ERROR, "Failed to open log file %s", log_file_path);
 
     free(port_str);
     free(threads_str);
     free(cache_items_str);
     free(cache_size_str);
-    // document_root freed at end of main
+    free(log_level_str);
 
-    // Print loaded config
-    printf("Loaded configuration:\n");
-    printf("  port:            %u\n", port);
-    printf("  document_root:   %s\n", document_root);
-    printf("  thread_count:    %d\n", thread_count);
-    printf("  cache max_items: %d\n", cache_max_items);
-    printf("  cache max_size:  %zu bytes (%.1f MB)\n", cache_max_size, (double)cache_max_size / (1024*1024));
+    log_message(LOG_INFO, "Server starting...");
+    log_message(LOG_INFO,
+        "Loaded configuration: port=%u, document_root=%s, threads=%d, "
+        "cache_items=%d, cache_size=%.1f MB",
+        port, document_root, thread_count,
+        cache_max_items, (double)cache_max_size / (1024 * 1024));
 
-    // Create and bind listening socket
     int server_fd = create_and_bind_socket(port);
     if (server_fd < 0) {
+        log_message(LOG_ERROR, "Failed to bind socket on port %u", port);
+        if (log_file) fclose(log_file);
         free((void*)document_root);
         return EXIT_FAILURE;
     }
 
-    // Initialize thread pool with configured number of workers
     if (thread_pool_init(thread_count) != 0) {
+        log_message(LOG_ERROR,
+            "Failed to initialize thread pool with %d workers", thread_count);
         close(server_fd);
+        if (log_file) fclose(log_file);
         free((void*)document_root);
         return EXIT_FAILURE;
     }
 
-    // Initialize mmap-based LRU cache
     cache_init();
 
-    // Initialize epoll instance
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
-        perror("epoll_create1 failed");
+        log_message(LOG_ERROR, "epoll_create1 failed");
         cache_destroy();
         thread_pool_shutdown();
         close(server_fd);
+        if (log_file) fclose(log_file);
         free((void*)document_root);
         return EXIT_FAILURE;
     }
 
-    // Add server socket to epoll (monitor for new connections)
     struct epoll_event ev = { .events = EPOLLIN, .data.fd = server_fd };
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
-        perror("epoll_ctl ADD server_fd failed");
+        log_message(LOG_ERROR, "epoll_ctl ADD server_fd failed");
         close(epoll_fd);
         cache_destroy();
         thread_pool_shutdown();
         close(server_fd);
+        if (log_file) fclose(log_file);
         free((void*)document_root);
         return EXIT_FAILURE;
     }
 
     struct epoll_event events[MAX_EVENTS];
 
-    printf("Server running on port %u with %d workers. Press Ctrl+C to shut down.\n", port, thread_count);
-    fflush(stdout);
+    log_message(LOG_INFO,
+        "Server running on port %u with %d workers. Press Ctrl+C to shut down.",
+        port, thread_count);
 
-    // Main event loop
     while (running) {
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
         if (nfds < 0) {
             if (errno == EINTR && !running) break;
-            perror("epoll_wait");
+            log_message(LOG_ERROR, "epoll_wait failed: %s", strerror(errno));
             continue;
         }
 
@@ -1039,9 +110,10 @@ int main(void) {
                 struct sockaddr_in client_addr;
                 socklen_t len = sizeof(client_addr);
 
-                int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &len);
+                int client_fd = accept(server_fd,
+                                       (struct sockaddr*)&client_addr, &len);
                 if (client_fd < 0) {
-                    perror("accept");
+                    log_message(LOG_ERROR, "accept failed: %s", strerror(errno));
                     continue;
                 }
 
@@ -1049,7 +121,46 @@ int main(void) {
             }
         }
 
-        // Print metrics summary every 10 seconds
+        if (reload) {
+            reload = 0;
+            log_message(LOG_INFO, "Reloading configuration...");
+
+            char* new_port_str = get_ini_value("server.conf", "server",
+                                               "port", "8080");
+            uint16_t new_port = (uint16_t)atoi(new_port_str);
+            free(new_port_str);
+
+            char* new_doc_root = get_ini_value("server.conf", "server",
+                                               "document_root", "./www");
+            free((void*)document_root);
+            document_root = new_doc_root;
+
+            char* new_threads_str = get_ini_value("server.conf", "server",
+                                                  "thread_count", "4");
+            int new_thread_count = atoi(new_threads_str);
+            free(new_threads_str);
+
+            char* new_log_level = get_ini_value("server.conf", "logging",
+                                                "level", "INFO");
+            if (strcasecmp(new_log_level, "ERROR") == 0)
+                current_log_level = LOG_ERROR;
+            else
+                current_log_level = LOG_INFO;
+            free(new_log_level);
+
+            log_message(LOG_INFO,
+                "Reload complete: port=%u, document_root=%s, threads=%d, log_level=%s",
+                new_port, document_root, new_thread_count,
+                (current_log_level == LOG_INFO ? "INFO" : "ERROR"));
+
+            if (new_port != port)
+                log_message(LOG_INFO,
+                    "Port changed to %u - requires restart", new_port);
+            if (new_thread_count != thread_count)
+                log_message(LOG_INFO,
+                    "Thread count changed to %d - requires restart", new_thread_count);
+        }
+
         static time_t last_print = 0;
         time_t now = time(NULL);
         if (now - last_print >= 10) {
@@ -1058,19 +169,20 @@ int main(void) {
         }
     }
 
-    // Graceful shutdown
-    printf("\nShutting down...\n");
-
-    // Final metrics summary before exit
+    log_message(LOG_INFO, "Shutting down server...");
     metrics_print_summary();
 
     close(epoll_fd);
     cache_destroy();
     thread_pool_shutdown();
     close(server_fd);
-    free((void*)document_root);
 
-    printf("Server closed.\n");
-    free((void*)doc_root_str);
+    if (log_file) {
+        fclose(log_file);
+        log_file = NULL;
+    }
+
+    free((void*)document_root);
+    log_message(LOG_INFO, "Server closed.");
     return EXIT_SUCCESS;
 }

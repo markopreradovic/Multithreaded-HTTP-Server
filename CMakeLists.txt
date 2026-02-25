@@ -11,9 +11,16 @@ find_package(Threads REQUIRED)
 
 add_executable(httpserver
         src/main.c
+        src/cache.c
+        src/config.c
+        src/http.c
+        src/logger.c
+        src/metrics.c
+        src/server.c
+        src/thread_pool.c
 )
 
 target_link_libraries(httpserver PRIVATE
-        Threads::Threads     # pthread biblioteka
-        rt                   # realtime biblioteka (clock_gettime, itd.)
+        Threads::Threads
+        rt
 )
