@@ -162,23 +162,27 @@ static void print_request(const http_request_t* req) {
     fflush(stdout);
 }
 
+// Send generic HTTP response
 static void send_response(int client_fd, int status, const char* body, size_t body_len, const char* content_type) {
     char header[1024];
-    const char* status_text = (status == 200) ? "OK" : "Not Found";
+    const char* status_text = (status == 200) ? "OK" :
+                              (status == 404) ? "Not Found" :
+                              "Bad Request";
+
     snprintf(header, sizeof(header),
              "HTTP/1.1 %d %s\r\n"
              "Server: %s\r\n"
              "Content-Type: %s\r\n"
              "Content-Length: %zu\r\n"
-             "Connection: close\r\n"           // keep-alive later
+             "Connection: close\r\n"   // keep-alive handled in worker loop
              "\r\n",
              status, status_text,
              SERVER_NAME,
              content_type,
              body_len);
-    //Sending header..
+
     send(client_fd, header, strlen(header), 0);
-    if (body && body_len > 0) send(client_fd,body,body_len,0);
+    if (body && body_len > 0) send(client_fd, body, body_len, 0);
 }
 
 static void send_404(int client_fd) {
@@ -186,6 +190,7 @@ static void send_404(int client_fd) {
         "<!DOCTYPE html>\n"
         "<html><head><title>404 Not Found</title></head>\n"
         "<body><h1>404 Not Found</h1><p>The requested resource was not found on this server.</p></body></html>";
+
     send_response(client_fd, 404, body, strlen(body), "text/html; charset=utf-8");
 }
 
@@ -358,7 +363,7 @@ static int serve_file(int client_fd, const char* filepath) {
                  "Server: %s\r\n"
                  "Content-Type: %s\r\n"
                  "Content-Length: %zu\r\n"
-                 "Connection: close\r\n"
+                 "Connection: close\r\n"  // keep-alive handled in loop
                  "\r\n",
                  SERVER_NAME,
                  get_content_type(filepath),
@@ -374,7 +379,7 @@ static int serve_file(int client_fd, const char* filepath) {
                 break;
             }
         }
-        return 200;  // success
+        return 200;
     }
 
     metrics_increment_cache_miss();
@@ -383,14 +388,14 @@ static int serve_file(int client_fd, const char* filepath) {
     if (fd < 0) {
         perror("[serve_file] open failed");
         send_404(client_fd);
-        return 404;  // not found
+        return 404;
     }
 
     struct stat st;
     if (fstat(fd, &st) < 0) {
         close(fd);
         send_404(client_fd);
-        return 500;  // internal error
+        return 500;
     }
 
     size_t file_size = st.st_size;
@@ -419,7 +424,7 @@ static int serve_file(int client_fd, const char* filepath) {
     }
 
     close(fd);
-    return 200;  // success
+    return 200;
 }
 
 // Record latency in microseconds
@@ -527,7 +532,7 @@ static void metrics_print_summary(void) {
 }
 
 // Simple JSON metrics response
-static void send_metrics_json(int client_fd) {
+static void send_metrics_json(int client_fd, bool keep_alive) {
     uint64_t total    = atomic_load_explicit(&total_requests,      memory_order_relaxed);
     uint64_t hits     = atomic_load_explicit(&cache_hits,          memory_order_relaxed);
     uint64_t misses   = atomic_load_explicit(&cache_misses,        memory_order_relaxed);
@@ -558,15 +563,30 @@ static void send_metrics_json(int client_fd) {
              "Server: %s\r\n"
              "Content-Type: application/json\r\n"
              "Content-Length: %zu\r\n"
-             "Connection: close\r\n"
+             "Connection: %s\r\n"
              "\r\n",
              SERVER_NAME,
-             strlen(json));
+             strlen(json),
+             keep_alive ? "keep-alive" : "close");
 
     send(client_fd, header, strlen(header), 0);
     send(client_fd, json, strlen(json), 0);
 }
+const char* document_root = "./www";
 
+// Check if client wants keep-alive
+static bool is_keep_alive(const http_request_t* req) {
+    for (int i = 0; i < req->header_count; i++) {
+        if (strncasecmp(req->headers[i], "Connection:", 11) == 0) {
+            const char* val = req->headers[i] + 11;
+            while (*val && isspace(*val)) val++;
+            if (strncasecmp(val, "keep-alive", 10) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;  // default close for HTTP/1.0 or explicit close
+}
 // Worker thread - main request processing loop
 static void* worker_thread(void* arg) {
     (void)arg;
@@ -574,13 +594,10 @@ static void* worker_thread(void* arg) {
     while (1) {
         task_t* task = NULL;
 
-        // Wait for task
         pthread_mutex_lock(&pool.queue_mutex);
-
         while (pool.queue_head == NULL && !pool.shutdown) {
             pthread_cond_wait(&pool.queue_cond, &pool.queue_mutex);
         }
-
         if (pool.shutdown) {
             pthread_mutex_unlock(&pool.queue_mutex);
             return NULL;
@@ -591,92 +608,77 @@ static void* worker_thread(void* arg) {
         if (pool.queue_head == NULL) {
             pool.queue_tail = NULL;
         }
-
         pthread_mutex_unlock(&pool.queue_mutex);
 
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &task->client_addr.sin_addr, client_ip, sizeof(client_ip));
-
         uint16_t client_port = ntohs(task->client_addr.sin_port);
 
-        printf("[Worker] Processing connection from %s:%u (fd=%d)\n",
-               client_ip, client_port, task->client_fd);
+        printf("[Worker] Processing connection from %s:%u (fd=%d)\n", client_ip, client_port, task->client_fd);
 
-        // Start latency measurement
-        struct timespec start;
-        clock_gettime(CLOCK_MONOTONIC, &start);
-        uint64_t start_ns = start.tv_sec * 1000000000ULL + start.tv_nsec;
+        int client_fd = task->client_fd;
+        free(task);  // task više nije potreban
 
-        http_request_t req;
-        memset(&req, 0, sizeof(req));
+        bool keep_alive = true;  // assume keep-alive until client closes or says close
 
-        // Parse HTTP request
-        if (parse_request(task->client_fd, &req) != 0) {
-            printf("[Worker] Parse failed or connection closed early from %s:%u\n",
-                   client_ip, client_port);
-            send_response(task->client_fd, 400, "<h1>400 Bad Request</h1>", 23, "text/html");
-            metrics_increment_failure();
-            metrics_record_latency(start_ns);
-            goto cleanup;
-        }
+        while (keep_alive && running) {
+            struct timespec start;
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            uint64_t start_ns = start.tv_sec * 1000000000ULL + start.tv_nsec;
 
-        print_request(&req);
+            http_request_t req;
+            memset(&req, 0, sizeof(req));
 
-        // Special /metrics endpoint
-        if (strcmp(req.uri, "/metrics") == 0) {
-            printf("[Worker] Serving /metrics JSON from %s:%u\n", client_ip, client_port);
-            send_metrics_json(task->client_fd);
-            metrics_increment_success();
-            metrics_record_latency(start_ns);
-            goto cleanup;
-        }
-
-        char full_path[2048] = {0};
-        extern const char* document_root;
-
-        // Basic path protection
-        if (strstr(req.uri, "..") != NULL ||
-            strstr(req.uri, "/.") != NULL ||
-            strstr(req.uri, "\\") != NULL) {
-            printf("[Worker] Forbidden path attempt: %s from %s:%u\n",
-                   req.uri, client_ip, client_port);
-            send_response(task->client_fd, 403, "<h1>403 Forbidden</h1>", 23, "text/html");
-            metrics_increment_failure();
-            metrics_record_latency(start_ns);
-            goto cleanup;
-        }
-
-        // Map URI to file path
-        if (strcmp(req.uri, "/") == 0 || strcmp(req.uri, "") == 0) {
-            snprintf(full_path, sizeof(full_path), "%s/index.html", document_root);
-        } else {
-            if (req.uri[0] != '/') {
-                snprintf(full_path, sizeof(full_path), "%s/%s", document_root, req.uri);
-            } else {
-                snprintf(full_path, sizeof(full_path), "%s%s", document_root, req.uri);
+            if (parse_request(client_fd, &req) != 0) {
+                // Client closed or error
+                keep_alive = false;
+                metrics_record_latency(start_ns);
+                break;
             }
+
+            print_request(&req);
+
+            // Check keep-alive header
+            keep_alive = is_keep_alive(&req);
+
+            if (strcmp(req.uri, "/metrics") == 0) {
+                printf("[Worker] Serving /metrics JSON from %s:%u\n", client_ip, client_port);
+                send_metrics_json(client_fd, keep_alive);
+                metrics_increment_success();
+            } else {
+                // Serve file
+                char full_path[1024] = {0};
+
+                if (strstr(req.uri, "..") != NULL || strstr(req.uri, "/.") != NULL || strstr(req.uri, "\\") != NULL) {
+                    printf("[Worker] Forbidden path attempt: %s from %s:%u\n", req.uri, client_ip, client_port);
+                    send_404(client_fd);
+                    metrics_increment_failure();
+                } else {
+                    if (strcmp(req.uri, "/") == 0 || strcmp(req.uri, "") == 0) {
+                        snprintf(full_path, sizeof(full_path), "%s/index.html", document_root);
+                    } else {
+                        snprintf(full_path, sizeof(full_path), "%s%s", document_root, req.uri);
+                    }
+
+                    printf("[Worker] Attempting to serve: %s for URI %s from %s:%u\n", full_path, req.uri, client_ip, client_port);
+                    int status = serve_file(client_fd, full_path);
+
+                    if (status >= 200 && status < 300) {
+                        metrics_increment_success();
+                    } else {
+                        metrics_increment_failure();
+                    }
+                }
+            }
+
+            metrics_record_latency(start_ns);
+
+            free_request(&req);
+
+            if (!keep_alive) break;
         }
 
-        printf("[Worker] Attempting to serve: %s for URI %s from %s:%u\n",
-               full_path, req.uri, client_ip, client_port);
-
-        // Serve file and get status
-        int status = serve_file(task->client_fd, full_path);
-
-        // Update success/failure based on returned status
-        if (status >= 200 && status < 300) {
-            metrics_increment_success();
-        } else {
-            metrics_increment_failure();
-        }
-
-        // Record latency
-        metrics_record_latency(start_ns);
-
-    cleanup:
-        free_request(&req);
-        close(task->client_fd);
-        free(task);
+        close(client_fd);
     }
 
     return NULL;
@@ -846,7 +848,9 @@ static int create_and_bind_socket(uint16_t port) {
     return server_fd;
 }
 
-const char* document_root = "./www";
+
+
+
 
 int main(void) {
     // Register signal handlers
