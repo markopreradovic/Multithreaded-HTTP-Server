@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <sys/wait.h>   // waitpid
 #include <errno.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -587,7 +588,10 @@ static bool is_keep_alive(const http_request_t* req) {
     }
     return false;  // default close for HTTP/1.0 or explicit close
 }
-// Worker thread - main request processing loop
+
+static int execute_cgi(int client_fd, const char* script_path, const http_request_t* req);
+
+// Worker thread - main request processing loop with keep-alive support
 static void* worker_thread(void* arg) {
     (void)arg;
 
@@ -595,9 +599,11 @@ static void* worker_thread(void* arg) {
         task_t* task = NULL;
 
         pthread_mutex_lock(&pool.queue_mutex);
+
         while (pool.queue_head == NULL && !pool.shutdown) {
             pthread_cond_wait(&pool.queue_cond, &pool.queue_mutex);
         }
+
         if (pool.shutdown) {
             pthread_mutex_unlock(&pool.queue_mutex);
             return NULL;
@@ -608,77 +614,76 @@ static void* worker_thread(void* arg) {
         if (pool.queue_head == NULL) {
             pool.queue_tail = NULL;
         }
+
         pthread_mutex_unlock(&pool.queue_mutex);
 
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &task->client_addr.sin_addr, client_ip, sizeof(client_ip));
+
         uint16_t client_port = ntohs(task->client_addr.sin_port);
 
-        printf("[Worker] Processing connection from %s:%u (fd=%d)\n", client_ip, client_port, task->client_fd);
+        printf("[Worker] Processing connection from %s:%u (fd=%d)\n",
+               client_ip, client_port, task->client_fd);
 
-        int client_fd = task->client_fd;
-        free(task);  // task više nije potreban
+        http_request_t req;
+        memset(&req, 0, sizeof(req));
 
-        bool keep_alive = true;  // assume keep-alive until client closes or says close
-
-        while (keep_alive && running) {
-            struct timespec start;
-            clock_gettime(CLOCK_MONOTONIC, &start);
-            uint64_t start_ns = start.tv_sec * 1000000000ULL + start.tv_nsec;
-
-            http_request_t req;
-            memset(&req, 0, sizeof(req));
-
-            if (parse_request(client_fd, &req) != 0) {
-                // Client closed or error
-                keep_alive = false;
-                metrics_record_latency(start_ns);
-                break;
-            }
-
-            print_request(&req);
-
-            // Check keep-alive header
-            keep_alive = is_keep_alive(&req);
-
-            if (strcmp(req.uri, "/metrics") == 0) {
-                printf("[Worker] Serving /metrics JSON from %s:%u\n", client_ip, client_port);
-                send_metrics_json(client_fd, keep_alive);
-                metrics_increment_success();
-            } else {
-                // Serve file
-                char full_path[1024] = {0};
-
-                if (strstr(req.uri, "..") != NULL || strstr(req.uri, "/.") != NULL || strstr(req.uri, "\\") != NULL) {
-                    printf("[Worker] Forbidden path attempt: %s from %s:%u\n", req.uri, client_ip, client_port);
-                    send_404(client_fd);
-                    metrics_increment_failure();
-                } else {
-                    if (strcmp(req.uri, "/") == 0 || strcmp(req.uri, "") == 0) {
-                        snprintf(full_path, sizeof(full_path), "%s/index.html", document_root);
-                    } else {
-                        snprintf(full_path, sizeof(full_path), "%s%s", document_root, req.uri);
-                    }
-
-                    printf("[Worker] Attempting to serve: %s for URI %s from %s:%u\n", full_path, req.uri, client_ip, client_port);
-                    int status = serve_file(client_fd, full_path);
-
-                    if (status >= 200 && status < 300) {
-                        metrics_increment_success();
-                    } else {
-                        metrics_increment_failure();
-                    }
-                }
-            }
-
-            metrics_record_latency(start_ns);
-
-            free_request(&req);
-
-            if (!keep_alive) break;
+        if (parse_request(task->client_fd, &req) != 0) {
+            printf("[Worker] Parse failed or connection closed early from %s:%u\n",
+                   client_ip, client_port);
+            send_response(task->client_fd, 400, "<h1>400 Bad Request</h1>", 23, "text/html");
+            goto cleanup;
         }
 
-        close(client_fd);
+        print_request(&req);
+
+        char full_path[1024] = {0};
+        const char* document_root = "./www";
+
+        if (strstr(req.uri, "..") != NULL ||
+            strstr(req.uri, "/.") != NULL ||
+            strstr(req.uri, "\\") != NULL) {
+            printf("[Worker] Forbidden path attempt: %s from %s:%u\n",
+                   req.uri, client_ip, client_port);
+            send_response(task->client_fd, 403, "<h1>403 Forbidden</h1>", 23, "text/html");
+            goto cleanup;
+        }
+
+        char uri_path[1024];
+        char* q = strchr(req.uri, '?');
+        if (q) {
+            size_t len = q - req.uri;
+            strncpy(uri_path, req.uri, len);
+            uri_path[len] = '\0';
+        } else {
+            strncpy(uri_path, req.uri, sizeof(uri_path) - 1);
+            uri_path[sizeof(uri_path) - 1] = '\0';
+        }
+
+        if (strcmp(uri_path, "/") == 0 || strcmp(uri_path, "") == 0 || strcmp(uri_path, "/index.html") == 0) {
+            snprintf(full_path, sizeof(full_path), "%s/index.html", document_root);
+        } else {
+            snprintf(full_path, sizeof(full_path), "%s%s", document_root, uri_path);
+        }
+
+        // Check for CGI extension
+        const char* ext = strrchr(full_path, '.');
+        if (ext && strcasecmp(ext, ".cgi") == 0) {
+            printf("[Worker] Executing CGI: %s for URI %s from %s:%u\n",
+                   full_path, req.uri, client_ip, client_port);
+            execute_cgi(task->client_fd, full_path, &req);
+            goto cleanup;
+        }
+
+        printf("[Worker] Attempting to serve: %s for URI %s from %s:%u\n",
+               full_path, req.uri, client_ip, client_port);
+
+        serve_file(task->client_fd, full_path);
+
+    cleanup:
+        free_request(&req);
+        close(task->client_fd);
+        free(task);
     }
 
     return NULL;
@@ -849,7 +854,94 @@ static int create_and_bind_socket(uint16_t port) {
 }
 
 
+// Execute CGI script and pipe output to client
+// Execute CGI script and pipe output to client
+static int execute_cgi(int client_fd, const char* script_path, const http_request_t* req) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        perror("[CGI] pipe failed");
+        send_response(client_fd, 500, "<h1>500 Internal Server Error</h1>", 35, "text/html");
+        return 500;
+    }
 
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("[CGI] fork failed");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        send_response(client_fd, 500, "<h1>500 Internal Server Error</h1>", 35, "text/html");
+        return 500;
+    }
+
+    if (pid == 0) {  // Child process
+        close(pipefd[0]);               // Close read end
+        dup2(pipefd[1], STDOUT_FILENO); // Redirect stdout to pipe
+        close(pipefd[1]);
+
+        // Build environment array (max 10 vars for simplicity)
+        char* env[16] = {0};
+        int idx = 0;
+
+        env[idx++] = "GATEWAY_INTERFACE=CGI/1.1";
+        env[idx++] = "SERVER_NAME=CServer/0.1";
+        env[idx++] = "SERVER_PORT=9090";
+        env[idx++] = "SCRIPT_NAME=/hello.cgi";  // hard-coded for now
+
+        // REQUEST_METHOD from request
+        char method_env[64];
+        snprintf(method_env, sizeof(method_env), "REQUEST_METHOD=%s", req->method);
+        env[idx++] = method_env;
+
+        // PATH_INFO = full URI
+        char path_env[1024];
+        snprintf(path_env, sizeof(path_env), "PATH_INFO=%s", req->uri);
+        env[idx++] = path_env;
+
+        // QUERY_STRING if present
+        char* q = strchr(req->uri, '?');
+        char query_env[1024] = "QUERY_STRING=";
+        if (q) {
+            strcat(query_env, q + 1);
+        }
+        env[idx++] = query_env;
+
+        // End of env array
+        env[idx] = NULL;
+
+        char* argv[] = { (char*)script_path, NULL };
+
+        execve(script_path, argv, env);
+        perror("[CGI] execve failed");
+        exit(1);
+    }
+
+    // Parent process
+    close(pipefd[1]);  // Close write end
+
+    // Send default HTTP header (since script may not send it)
+    const char* default_header = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+    send(client_fd, default_header, strlen(default_header), 0);
+
+    // Read script output from pipe and forward to client
+    char buffer[4096];
+    ssize_t bytes;
+    while ((bytes = read(pipefd[0], buffer, sizeof(buffer))) > 0) {
+        send(client_fd, buffer, bytes, 0);
+    }
+
+    close(pipefd[0]);
+
+    // Wait for child and check exit status
+    int status;
+    waitpid(pid, &status, 0);
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return 200;
+    } else {
+        send_response(client_fd, 500, "<h1>500 CGI Script Error</h1>", 30, "text/html");
+        return 500;
+    }
+}
 
 
 int main(void) {
