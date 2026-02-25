@@ -1,6 +1,6 @@
 # Multithreaded HTTP Server in C
 
-A high-performance, production-oriented HTTP/1.1 server written in C from scratch, featuring a thread pool, LRU mmap-based file cache, epoll-driven I/O, CGI script execution, INI configuration, and a real-time metrics system. Built without any external HTTP libraries — every component is implemented at the systems level.
+A high-performance, production-oriented HTTP/1.1 server written in C from scratch, featuring a thread pool with configurable worker count, an LRU file cache backed by `mmap` for zero-copy serving, an `epoll`-driven event loop for scalable connection handling, CGI/1.1 script execution via process forking, INI-based runtime configuration with live reload, and a real-time metrics system with latency percentile tracking. Every component — from the TCP socket and HTTP parser to the cache eviction policy and thread synchronization — is implemented at the systems level without any external networking or HTTP libraries.
 
 ---
 
@@ -25,9 +25,13 @@ A high-performance, production-oriented HTTP/1.1 server written in C from scratc
 
 ## Overview
 
-This project is a fully functional HTTP/1.1 server implemented in C11, targeting Linux systems. It is designed around core Unix systems programming concepts: non-blocking I/O with epoll, POSIX threads, memory-mapped file I/O, and process forking for CGI execution. The server is capable of handling concurrent connections using a fixed-size thread pool and serving static files from disk with an LRU cache backed by `mmap`.
+This project is a fully functional HTTP/1.1 server implemented in C11, targeting Linux systems. It is designed entirely around core Unix systems programming concepts: non-blocking I/O multiplexing with `epoll`, concurrent request processing with POSIX threads, memory-mapped file I/O with `mmap`, zero-copy file transfer with `sendfile`, and CGI script execution via `fork` and `execve`. The server handles multiple simultaneous connections through a fixed-size thread pool and serves static files efficiently using an LRU cache that keeps frequently accessed files mapped in memory, avoiding repeated disk reads.
 
-The goal of this project was to understand and implement the internals of a real web server — connection handling, request parsing, response generation, caching, concurrency, and observability — without relying on any third-party networking or HTTP libraries.
+The project was built as a deep dive into how production HTTP servers actually work under the hood. Rather than using a framework or library, every layer is written by hand: the TCP socket is created and bound manually, the HTTP request line and headers are parsed from raw bytes, file content is served through kernel-space transfer calls, cache eviction is managed with a doubly linked list, and worker threads are coordinated through a mutex-protected task queue and condition variables.
+
+The scope of the project covers the full lifecycle of an HTTP request — from `accept` on the listening socket, through parsing and routing, to response generation and connection teardown — as well as the surrounding infrastructure that makes a server operationally useful: structured logging with timestamps and log levels, an access log with per-request timing, a real-time metrics system using lock-free atomic counters, a JSON metrics endpoint, live configuration reload via Unix signals, and protection against common path traversal attacks.
+
+This is not a toy server that handles one request at a time. It is structured the way real servers are structured: a single-threaded event loop accepts connections as fast as possible and hands them off to a pool of workers, each operating independently. The codebase is split into focused modules with clear interfaces, compiled through CMake, and tested against real HTTP clients.
 
 ---
 
