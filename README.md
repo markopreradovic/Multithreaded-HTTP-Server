@@ -192,7 +192,7 @@ kill -HUP <pid>
 **Build steps:**
 
 ```bash
-git clone https://github.com/yourusername/Multithreaded-HTTP-Server.git
+git clone https://github.com/markopreradovic/Multithreaded-HTTP-Server.git
 cd Multithreaded-HTTP-Server
 mkdir build && cd build
 cmake ..
